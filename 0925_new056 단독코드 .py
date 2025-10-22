@@ -1,7 +1,5 @@
-# new056.py (EA_ADD_CODE → 자리별 앵커 고정)
-# 기존 UI 유지: ① NLK EA_ADD_CODE의 뒤 3자리에서 '0이 아닌 각 자리'를 앵커로 고정
-#               ② 알라딘 + LLM으로 강·목·세목 보정
-#               ③ 맨 하단에 근거(순위·조합 + 세부 요소) 표시
+# new056.py (EA_ADD_CODE → 자리별 앵커 고정 + 근거/순위 파싱 보강)
+# 기존 UI 유지: ① EA_ADD_CODE 뒤 3자리 중 0이 아닌 자리 고정 → ② 알라딘 + LLM → ③ 근거(순위·조합 + 세부 요소)
 
 import os
 import re
@@ -9,7 +7,7 @@ import json
 import html
 import urllib.parse
 from dataclasses import dataclass
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List
 from bs4 import BeautifulSoup
 from pathlib import Path
 
@@ -70,7 +68,6 @@ class BookInfo:
     extra: Dict[str, Any] = None
 
 # ───────── 유틸 ─────────
-
 def clean_text(s: Optional[str]) -> str:
     if not s:
         return ""
@@ -92,7 +89,6 @@ def normalize_isbn13(isbn: str) -> str:
     return s[-13:] if len(s) >= 13 else s
 
 # ───────── EA_ADD_CODE 조회 ─────────
-
 def get_ea_add_code_last3(isbn13: str, key: str) -> Optional[str]:
     """1차: 서지 API → docs[0].EA_ADD_CODE, 2차: 일반검색 API → recordList[0].EA_ADD_CODE"""
     if not key:
@@ -148,11 +144,10 @@ def get_ea_add_code_last3(isbn13: str, key: str) -> Optional[str]:
         return None
 
 # ───────── 자리별 앵커 유틸 ─────────
-
 def build_anchor_from_last3(last3: Optional[str]) -> Dict[str, Optional[str]]:
-    """last3 예: '813' → 8/1/3 중 0보다 큰 자리만 고정.
-    반환: {"hundreds":"8", "tens":"1", "units":"3", "pattern":"8-1-3"}
-    '800' → {"hundreds":"8","tens":None,"units":None,"pattern":"8-x-x"}
+    """
+    last3 예: '813' → 백=8, 십=1, 일=3 (0보다 큰 자리만 고정)
+    '800' → 백=8만 고정, 'x-x-x' 패턴 표기
     """
     anchors = {"hundreds": None, "tens": None, "units": None, "pattern": "x-x-x"}
     if not (last3 and len(last3) == 3 and last3.isdigit()):
@@ -164,7 +159,6 @@ def build_anchor_from_last3(last3: Optional[str]) -> Dict[str, Optional[str]]:
     anchors["pattern"]  = f"{anchors['hundreds'] or 'x'}-{anchors['tens'] or 'x'}-{anchors['units'] or 'x'}"
     return anchors
 
-
 def anchor_clause_for_prompt(anc: Dict[str, Optional[str]]) -> str:
     rules = []
     if anc.get("hundreds"): rules.append(f"백의 자리는 {anc['hundreds']}")
@@ -174,9 +168,10 @@ def anchor_clause_for_prompt(anc: Dict[str, Optional[str]]) -> str:
         return ""
     mask = anc.get("pattern", "x-x-x").replace("-", "")
     examples = [mask.replace("x", d) for d in ["0","1","2"]]
-    return (" 반드시 다음 자릿수 제약을 지켜라: " + ", ".join(rules) + 
-            f". 즉, 분류번호는 '{mask}' 패턴으로 시작해야 한다(예: {', '.join(e + '.7' for e in examples)}). ")
-
+    return (
+        " 반드시 다음 자릿수 제약을 지켜라: " + ", ".join(rules) +
+        f". 즉, 분류번호는 '{mask}' 패턴으로 시작해야 한다(예: {', '.join(e + '.7' for e in examples)}). "
+    )
 
 def enforce_anchor_digits(code: Optional[str], anc: Dict[str, Optional[str]]) -> Optional[str]:
     if not code:
@@ -194,12 +189,14 @@ def enforce_anchor_digits(code: Optional[str], anc: Dict[str, Optional[str]]) ->
     return fixed
 
 # ───────── 알라딘 API/웹 ─────────
-
 def aladin_lookup_by_api(isbn13: str, ttbkey: str) -> Optional[BookInfo]:
     if not ttbkey:
         return None
-    params = {"ttbkey": ttbkey, "itemIdType": "ISBN13", "ItemId": isbn13, "output": "js", "Version": "20131101",
-              "OptResult": "authors,categoryName,fulldescription,toc,packaging,ratings"}
+    params = {
+        "ttbkey": ttbkey, "itemIdType": "ISBN13", "ItemId": isbn13,
+        "output": "js", "Version": "20131101",
+        "OptResult": "authors,categoryName,fulldescription,toc,packaging,ratings"
+    }
     try:
         r = requests.get(ALADIN_LOOKUP_URL, params=params, headers=HEADERS, timeout=15)
         r.raise_for_status()
@@ -210,15 +207,15 @@ def aladin_lookup_by_api(isbn13: str, ttbkey: str) -> Optional[BookInfo]:
             return None
         it = items[0]
         return BookInfo(
-            title=clean_text(it.get("title")), author=clean_text(it.get("author")), pub_date=clean_text(it.get("pubDate")),
-            publisher=clean_text(it.get("publisher")), isbn13=clean_text(it.get("isbn13")) or isbn13,
-            category=clean_text(it.get("categoryName")), description=clean_text(it.get("fulldescription")) or clean_text(it.get("description")),
+            title=clean_text(it.get("title")), author=clean_text(it.get("author")),
+            pub_date=clean_text(it.get("pubDate")), publisher=clean_text(it.get("publisher")),
+            isbn13=clean_text(it.get("isbn13")) or isbn13, category=clean_text(it.get("categoryName")),
+            description=clean_text(it.get("fulldescription")) or clean_text(it.get("description")),
             toc=clean_text(it.get("toc")), extra=it,
         )
     except Exception as e:
         st.info(f"알라딘 API 호출 예외 → {e} / 스크레이핑 백업 시도")
         return None
-
 
 def aladin_lookup_by_web(isbn13: str) -> Optional[BookInfo]:
     try:
@@ -266,28 +263,42 @@ def aladin_lookup_by_web(isbn13: str) -> Optional[BookInfo]:
         if crumbs: cat_text = clean_text(" > ".join(c.get_text(" ") for c in crumbs))
         with st.expander("디버그: 스크레이핑 진입 URL / 파싱 결과"):
             st.write({"item_url": item_url, "title": title})
-        return BookInfo(title=title, description=description, isbn13=isbn13, author=author, publisher=publisher, pub_date=pub_date, category=cat_text)
+        return BookInfo(title=title, description=description, isbn13=isbn13,
+                        author=author, publisher=publisher, pub_date=pub_date, category=cat_text)
     except Exception as e:
         st.error(f"웹 스크레이핑 예외: {e}")
         return None
 
 # ───────── LLM 호출 ─────────
-
 def ask_llm_for_kdc(book: BookInfo, api_key: str, model: str, anchor_clause: str) -> Optional[str]:
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY가 필요합니다. 사이드바 또는 환경변수로 입력하세요.")
     sys_prompt = (
         "너는 한국 십진분류(KDC) 전문가다. 아래 도서 정보를 보고 KDC 분류기호를 '숫자만' 출력해라. "
-        "형식 예시: 813.7 / 325.1 / 005 / 181 등. 설명, 접두/접미 텍스트, 기타 문자는 금지." + anchor_clause
+        "형식 예시: 813.7 / 325.1 / 005 / 181 등. 설명, 접두/접미 텍스트, 기타 문자는 금지."
+        + anchor_clause
     )
-    payload = {"title": book.title, "author": book.author, "publisher": book.publisher, "pub_date": book.pub_date,
-               "isbn13": book.isbn13, "category": book.category, "description": book.description[:1200], "toc": book.toc[:800]}
+    payload = {
+        "title": book.title, "author": book.author, "publisher": book.publisher, "pub_date": book.pub_date,
+        "isbn13": book.isbn13, "category": book.category,
+        "description": book.description[:1200], "toc": book.toc[:800]
+    }
     user_prompt = "도서 정보(JSON):\n" + json.dumps(payload, ensure_ascii=False, indent=2) + "\n\nKDC 숫자만 출력:"
     try:
-        resp = requests.post(OPENAI_CHAT_COMPLETIONS,
+        resp = requests.post(
+            OPENAI_CHAT_COMPLETIONS,
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json={"model": model, "messages": [{"role":"system","content":sys_prompt},{"role":"user","content":user_prompt}],
-                  "temperature":0.0, "max_tokens":16}, timeout=30)
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": 0.0,
+                "max_tokens": 16,
+            },
+            timeout=30,
+        )
         resp.raise_for_status()
         data = resp.json()
         text = (data["choices"][0]["message"]["content"] or "").strip()
@@ -296,42 +307,120 @@ def ask_llm_for_kdc(book: BookInfo, api_key: str, model: str, anchor_clause: str
         st.error(f"LLM 호출 오류: {e}")
         return None
 
+# ───────── JSON 파싱 보강 유틸 ─────────
+def _extract_json_object(text: str) -> Optional[str]:
+    """응답에서 최상위 JSON 객체만 안전하게 추출(코드펜스/프리텍스트 섞임 대비)."""
+    if not text:
+        return None
+    m = re.search(r"```json\s*(\{[\s\S]*?\})\s*```", text, re.I)
+    if m:
+        return m.group(1)
+    start = text.find("{")
+    if start == -1:
+        return None
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        else:
+            if ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start:i+1]
+    return None
 
+def _sanitize_json(s: str) -> str:
+    """자잘한 문법 오류 보정: 스마트쿼트/트레일링 콤마/컨트롤문자 제거 등."""
+    s = s.replace("“", '"').replace("”", '"').replace("’", "'").replace("‘", "'")
+    s = re.sub(r"```.*?```", "", s, flags=re.S)
+    s = re.sub(r",\s*([}\]])", r"\1", s)
+    s = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", s)
+    return s
+
+# ───────── 근거/순위 JSON 파싱 보강 ─────────
 def ask_llm_for_kdc_ranking(book: BookInfo, api_key: str, model: str, anchor_clause: str) -> Optional[List[Dict[str, Any]]]:
     if not api_key:
         return None
     sys_prompt = (
         "너는 한국 십진분류(KDC) 전문가다. 아래 도서 정보를 분석하여 상위 후보를 JSON으로만 반환하라. "
-        "스키마: {\"candidates\":[{\"code\":str,\"confidence\":float,\"evidence_terms\":[str...],\"_view\":str,\"factors\":{str:float}}]} "
-        "confidence는 0~1. evidence_terms는 근거 키워드 1~8개. factors에는 판단 요소별 가중치(예: title,category,author,publisher,desc,toc)를 0~1로 첨부." + anchor_clause
+        '반드시 다음 스키마를 지켜라: {"candidates":[{"code":str,"confidence":number,'
+        '"evidence_terms":[str...],"_view":str,"factors":{"title":number,"category":number,'
+        '"author":number,"publisher":number,"desc":number,"toc":number}}]} '
+        "추가 텍스트 금지. 코드펜스 금지. 배열 길이는 3~5. "
+        + anchor_clause
     )
-    payload = {"title": book.title, "author": book.author, "publisher": book.publisher, "pub_date": book.pub_date,
-               "isbn13": book.isbn13, "category": book.category, "description": book.description[:1200], "toc": book.toc[:800]}
-    user_prompt = "도서 정보(JSON):\n" + json.dumps(payload, ensure_ascii=False, indent=2) + "\n\n상위 후보 3~5개를 confidence 내림차순 JSON만 반환."
+    payload = {
+        "title": book.title, "author": book.author, "publisher": book.publisher,
+        "pub_date": book.pub_date, "isbn13": book.isbn13, "category": book.category,
+        "description": book.description[:1200], "toc": book.toc[:800]
+    }
+    user_prompt = (
+        "도서 정보(JSON):\n" + json.dumps(payload, ensure_ascii=False, indent=2) +
+        "\n\n위 정보를 바탕으로 상위 후보 3~5개를 confidence 내림차순으로 산출해, "
+        "오직 하나의 JSON 객체만 반환해."
+    )
     try:
-        resp = requests.post(OPENAI_CHAT_COMPLETIONS,
+        resp = requests.post(
+            OPENAI_CHAT_COMPLETIONS,
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json={"model": model, "messages": [{"role":"system","content":sys_prompt},{"role":"user","content":user_prompt}],
-                  "temperature":0.0, "max_tokens":420}, timeout=30)
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": 0.0,
+                "max_tokens": 520,
+            },
+            timeout=30,
+        )
         resp.raise_for_status()
-        data = resp.json(); text = (data["choices"][0]["message"]["content"] or "").strip()
-        js_start, js_end = text.find("{"), text.rfind("}")
-        if js_start != -1 and js_end != -1: text = text[js_start:js_end+1]
-        parsed = json.loads(text)
+        text = (resp.json()["choices"][0]["message"]["content"] or "").strip()
+        raw = _extract_json_object(text) or text
+        safe = _sanitize_json(raw)
+        parsed = json.loads(safe)
+
         cands = parsed.get("candidates") if isinstance(parsed, dict) else None
         if isinstance(cands, list) and cands:
-            try: cands = sorted(cands, key=lambda x: float(x.get("confidence",0)), reverse=True)
-            except Exception: pass
+            for c in cands:
+                if "confidence" in c:
+                    try: c["confidence"] = float(c["confidence"])
+                    except Exception: pass
+                fx = c.get("factors")
+                if isinstance(fx, dict):
+                    for k, v in list(fx.items()):
+                        try: fx[k] = float(v)
+                        except Exception: pass
+            try:
+                cands = sorted(cands, key=lambda x: float(x.get("confidence", 0)), reverse=True)
+            except Exception:
+                pass
             return cands
+
+        st.info("근거/순위 JSON: candidates가 비어 있거나 형식이 일치하지 않습니다.")
+        return None
+
+    except json.JSONDecodeError as je:
+        st.warning(f"근거/순위 JSON 생성 실패(JSONDecode): {je}")
         return None
     except Exception as e:
         st.info(f"근거/순위 JSON 생성 실패: {e}")
         return None
 
-# ───────── 파이프라인 ─────────
-
+# ───────── 간단 규칙 적중 ─────────
 def extract_rule_hits(info: BookInfo) -> Dict[str, List[str]]:
-    """간단 규칙 매칭(제목/카테고리/설명 키워드)"""
     text = f"{info.title} {info.category} {info.description[:400]}" if info else ""
     buckets = {
         "문학": ["소설","문학","시집","희곡","에세이","수필"],
@@ -350,12 +439,11 @@ def extract_rule_hits(info: BookInfo) -> Dict[str, List[str]]:
             hits[k] = matched
     return hits
 
-
+# ───────── 파이프라인 ─────────
 def get_kdc_from_isbn(isbn13: str, ttbkey: Optional[str], openai_key: str, model: str) -> Dict[str, Any]:
     # 0) EA → last3 & 자리별 앵커
     last3 = get_ea_add_code_last3(isbn13, NLK_API_KEY)
     anchors = build_anchor_from_last3(last3)
-    ryu = anchors.get("hundreds")
 
     # 1) 알라딘
     info = aladin_lookup_by_api(isbn13, ttbkey) if ttbkey else None
@@ -376,18 +464,11 @@ def get_kdc_from_isbn(isbn13: str, ttbkey: Optional[str], openai_key: str, model
     # 4) 디버그 입력
     with st.expander("LLM 입력 정보(확인용)"):
         st.json({
-            "title": info.title,
-            "author": info.author,
-            "publisher": info.publisher,
-            "pub_date": info.pub_date,
-            "isbn13": info.isbn13,
-            "category": info.category,
+            "title": info.title, "author": info.author, "publisher": info.publisher, "pub_date": info.pub_date,
+            "isbn13": info.isbn13, "category": info.category,
             "description": (info.description[:600] + "…") if info.description and len(info.description) > 600 else info.description,
-            "toc": info.toc,
-            "ea_add_last3": last3,
-            "anchors": anchors,
-            "anchor_clause": anchor_clause,
-            "llm_raw": llm_raw,
+            "toc": info.toc, "ea_add_last3": last3, "anchors": anchors,
+            "anchor_clause": anchor_clause, "llm_raw": llm_raw,
         })
 
     # 5) 신호 요약 + 규칙 적중 내역
@@ -397,7 +478,6 @@ def get_kdc_from_isbn(isbn13: str, ttbkey: Optional[str], openai_key: str, model
     return {"code": code, "anchors": anchors, "ea_add_last3": last3, "ranking": ranking, "signals": signals, "llm_raw": llm_raw, "rule_hits": rule_hits}
 
 # ───────── UI ─────────
-
 st.title("📚 ISBN → KDC 추천 (EA 자리앵커 + 알라딘 + 챗G)")
 st.caption("① EA_ADD_CODE 뒤 3자리에서 0이 아닌 자리 숫자를 고정(예: 813→8·1·3 고정, 800→8만 고정) → ② 알라딘 수집 → ③ 챗G로 KDC 도출")
 
@@ -418,7 +498,6 @@ if go:
         last3 = result.get("ea_add_last3")
         anchors = result.get("anchors") or {}
         pattern = anchors.get("pattern", "x-x-x")
-        ryu = anchors.get("hundreds")
         if last3:
             st.markdown(f"- **EA_ADD_CODE 뒤 3자리**: `{last3}` → **앵커 패턴**: `{pattern}`")
         else:
@@ -437,22 +516,20 @@ if go:
         rule_hits = result.get("rule_hits") or {}
         ranking = result.get("ranking") or []
         llm_raw = result.get("llm_raw")
-
-        with st.expander("근거 요약", expanded=True):
-            st.markdown(f"- **EA 자리앵커**: 백={anchors.get('hundreds') or 'x'}, 십={anchors.get('tens') or 'x'}, 일={anchors.get('units') or 'x'} (패턴 `{pattern}`)")
-            st.markdown(f"- **LLM 원출력**: `{llm_raw or '-'}' → 앵커 보정 → `{code or '-'}`")
-            st.markdown(f"- **사용 메타데이터**: 제목='{sig.get('title','')}', 카테고리='{sig.get('category','')}', 저자='{sig.get('author','')}', 출판사='{sig.get('publisher','')}'")
-            if rule_hits:
-                st.markdown("- **규칙 적중**: " + ", ".join([f"{k}→{'+'.join(v)}" for k,v in rule_hits.items()]))
-            else:
-                st.markdown("- **규칙 적중**: 없음")
+        st.markdown(f"- **EA 자리앵커**: 백={anchors.get('hundreds') or 'x'}, 십={anchors.get('tens') or 'x'}, 일={anchors.get('units') or 'x'} (패턴 `{pattern}`)")
+        st.markdown(f"- **LLM 원출력**: `{llm_raw or '-'}` → 앵커 보정 → `{code or '-'}`")
+        st.markdown(f"- **사용 메타데이터**: 제목='{sig.get('title','')}', 카테고리='{sig.get('category','')}', 저자='{sig.get('author','')}', 출판사='{sig.get('publisher','')}'")
+        if rule_hits:
+            st.markdown("- **규칙 적중**: " + ", ".join([f"{k}→{'+'.join(v)}" for k, v in rule_hits.items()]))
+        else:
+            st.markdown("- **규칙 적중**: 없음")
 
         if ranking:
             import pandas as _pd
             rows = []
             for i, c in enumerate(ranking, start=1):
                 code_i = c.get("code"); conf = c.get("confidence")
-                try: conf_pct = f"{float(conf)*100:.1f}%" if conf is not None else ""
+                try: conf_pct = f"{float(conf)*100:.1f}%"
                 except Exception: conf_pct = ""
                 factors = c.get("factors", {}) if isinstance(c.get("factors"), dict) else {}
                 rows.append({
@@ -460,7 +537,10 @@ if go:
                     "KDC 후보": code_i,
                     "신뢰도": conf_pct,
                     "근거 키워드": ", ".join((c.get("evidence_terms") or [])[:8]),
-                    "가중치(title/category/author/publisher/desc/toc)": ", ".join([f"{k}:{factors.get(k):.2f}" for k in ["title","category","author","publisher","desc","toc"] if isinstance(factors.get(k),(int,float))]) or "-",
+                    "가중치(title/category/author/publisher/desc/toc)": ", ".join(
+                        [f"{k}:{factors.get(k):.2f}" for k in ["title","category","author","publisher","desc","toc"]
+                         if isinstance(factors.get(k), (int, float))]
+                    ) or "-",
                     "참조 뷰": c.get("_view", "")
                 })
             df = _pd.DataFrame(rows)
