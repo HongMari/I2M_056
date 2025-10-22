@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 KDC 분류기 (ISBN -> 알라딘 -> LLM 제로샷 + 얇은 규칙 하이브리드)
-- Streamlit Secrets 기반 보안 버전 (키 비노출)
-- UI 유지 + 하단 '분류 근거(Why)' 섹션 추가
+- Streamlit Secrets 기반(Cloud 호환) + 견고한 로더(섹션/루트/env 순차 탐색)
+- UI 유지 + 하단 '분류 근거(Why)' 섹션 + 사이드바 진단 로그(expander)
 - 정확도/안정성 패치 포함:
   top-K JSON, 깊이 스코어, 후보 재선택기, 상위류 재시도, critic pass, validator
 """
@@ -11,11 +11,12 @@ import json
 import requests
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Tuple
-
 import os
 import streamlit as st
 
-# --- Secrets 로더(섹션/루트/env 모두 탐색) ---------------------------
+# =========================
+# 🔐 Secrets 로더 (섹션/루트/env 모두 탐색)
+# =========================
 def _get_secret(candidate_names):
     """
     Streamlit Cloud의 Secrets(섹션[api_keys]/루트)와
@@ -34,7 +35,7 @@ def _get_secret(candidate_names):
             if val: return str(val)
         except Exception:
             pass
-        # 환경변수 (예: ALADIN, OPENAI, OPENAI_MODEL 등)
+        # 환경변수 (대문자 키도 확인)
         val = os.getenv(name.upper())
         if val: return str(val)
     return ""
@@ -42,8 +43,9 @@ def _get_secret(candidate_names):
 ALADIN_KEY   = _get_secret(["aladin", "aladin_ttb_key"])
 OPENAI_KEY   = _get_secret(["openai", "openai_api_key"])
 OPENAI_MODEL = _get_secret(["openai_model"]) or "gpt-4o-mini"
+OPENAI_CHAT_COMPLETIONS = "https://api.openai.com/v1/chat/completions"
 
-# --- 진단 로그(값은 노출하지 않고 키 유무만) -------------------------
+# --- 진단 로그(값은 노출하지 않고 '키 이름/유무'만 기록) -------------
 if "debug" not in st.session_state:
     st.session_state["debug"] = {
         "secrets_api_keys_keys": list(st.secrets.get("api_keys", {}).keys()) if "api_keys" in st.secrets else [],
@@ -54,15 +56,6 @@ if "debug" not in st.session_state:
                          "OPENAI_API_KEY": bool(os.getenv("OPENAI_API_KEY")),
                          "OPENAI_MODEL": bool(os.getenv("OPENAI_MODEL")) }
     }
-with st.sidebar:
-    st.markdown("### 설정")
-    st.text(f"🔑 알라딘 키: {'OK' if ALADIN_KEY else '미설정'}")
-    st.text(f"🤖 OpenAI 키: {'OK' if OPENAI_KEY else '미설정'}")
-    st.text(f"🧠 모델: {OPENAI_MODEL}")
-    with st.expander("진단(키 이름만 표시)"):
-        st.write("secrets[api_keys] keys:", st.session_state["debug"]["secrets_api_keys_keys"])
-        st.write("secrets root keys:", st.session_state["debug"]["secrets_root_keys"])
-        st.write("env present:", st.session_state["debug"]["env_present"])
 
 # =========================
 # 데이터 모델
@@ -483,7 +476,7 @@ def classify_kdc(book_info: BookInfo, openai_key: str, model: str) -> Tuple[Opti
     return final, ev
 
 # =========================
-# Streamlit UI (UI 유지 + 하단 근거 표시)
+# Streamlit UI (UI 유지 + 하단 근거 + 진단)
 # =========================
 st.set_page_config(page_title="KDC 분류기 자동 추천", page_icon="📚", layout="wide")
 
@@ -494,9 +487,13 @@ with st.sidebar:
     st.markdown("### 설정")
     st.text(f"🔑 알라딘 키: {'OK' if ALADIN_KEY else '미설정'}")
     st.text(f"🤖 OpenAI 키: {'OK' if OPENAI_KEY else '미설정'}")
-    model = st.text_input("OpenAI 모델", value=OPENAI_MODEL)
+    st.text(f"🧠 모델: {OPENAI_MODEL}")
+    with st.expander("진단(키 이름/유무만 표시)"):
+        st.write("secrets[api_keys] keys:", st.session_state["debug"]["secrets_api_keys_keys"])
+        st.write("secrets root keys:", st.session_state["debug"]["secrets_root_keys"])
+        st.write("env present:", st.session_state["debug"]["env_present"])
     st.markdown("---")
-    st.caption("환경설정은 `.streamlit/secrets.toml` 에서 관리됩니다.")
+    st.caption("Cloud의 Secrets는 TOML 형식입니다. 수정 후 반드시 Restart 하세요.")
 
 # 입력 영역 (UI 유지)
 isbn_input = st.text_input("ISBN-13 입력", value="", placeholder="예: 9788934939603")
@@ -535,7 +532,7 @@ if run_btn:
 
     # 분류 실행
     with st.spinner("분류기호 산출 중…"):
-        final_kdc, evidence = classify_kdc(book_info, OPENAI_KEY, model)
+        final_kdc, evidence = classify_kdc(book_info, OPENAI_KEY, OPENAI_MODEL)
 
     # 결과 표시 (UI 유지)
     st.markdown("### 📌 추천 분류기호 (KDC)")
@@ -607,5 +604,3 @@ if run_btn:
 
 else:
     st.info("ISBN-13을 입력한 후 ‘분류기호 추천’을 눌러주세요.")
-
-
