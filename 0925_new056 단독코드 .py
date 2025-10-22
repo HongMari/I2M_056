@@ -14,17 +14,57 @@ from typing import Optional, List, Dict, Tuple
 
 import streamlit as st
 
-# =========================
-# 🔐 Secrets ( .streamlit/secrets.toml )
-# [api_keys]
-# aladin = "ttbdawn63091003001"
-# openai = "sk-xxxxx"
-# openai_model = "gpt-4o-mini"
-# =========================
-ALADIN_KEY = st.secrets.get("api_keys", {}).get("aladin", "")
-OPENAI_KEY = st.secrets.get("api_keys", {}).get("openai", "")
-OPENAI_MODEL = st.secrets.get("api_keys", {}).get("openai_model", "gpt-4o-mini")
-OPENAI_CHAT_COMPLETIONS = "https://api.openai.com/v1/chat/completions"
+import os
+import streamlit as st
+
+# --- Secrets 로더(섹션/루트/env 모두 탐색) ---------------------------
+def _get_secret(candidate_names):
+    """
+    Streamlit Cloud의 Secrets(섹션[api_keys]/루트)와
+    환경변수(대문자)까지 순차 탐색하여 값을 찾는다.
+    """
+    for name in candidate_names:
+        # [api_keys] 섹션
+        try:
+            val = st.secrets.get("api_keys", {}).get(name)
+            if val: return str(val)
+        except Exception:
+            pass
+        # 루트 레벨
+        try:
+            val = st.secrets.get(name)
+            if val: return str(val)
+        except Exception:
+            pass
+        # 환경변수 (예: ALADIN, OPENAI, OPENAI_MODEL 등)
+        val = os.getenv(name.upper())
+        if val: return str(val)
+    return ""
+
+ALADIN_KEY   = _get_secret(["aladin", "aladin_ttb_key"])
+OPENAI_KEY   = _get_secret(["openai", "openai_api_key"])
+OPENAI_MODEL = _get_secret(["openai_model"]) or "gpt-4o-mini"
+
+# --- 진단 로그(값은 노출하지 않고 키 유무만) -------------------------
+if "debug" not in st.session_state:
+    st.session_state["debug"] = {
+        "secrets_api_keys_keys": list(st.secrets.get("api_keys", {}).keys()) if "api_keys" in st.secrets else [],
+        "secrets_root_keys": [k for k in st.secrets.keys() if k != "api_keys"],
+        "env_present": { "ALADIN": bool(os.getenv("ALADIN")),
+                         "ALADIN_TTB_KEY": bool(os.getenv("ALADIN_TTB_KEY")),
+                         "OPENAI": bool(os.getenv("OPENAI")),
+                         "OPENAI_API_KEY": bool(os.getenv("OPENAI_API_KEY")),
+                         "OPENAI_MODEL": bool(os.getenv("OPENAI_MODEL")) }
+    }
+with st.sidebar:
+    st.markdown("### 설정")
+    st.text(f"🔑 알라딘 키: {'OK' if ALADIN_KEY else '미설정'}")
+    st.text(f"🤖 OpenAI 키: {'OK' if OPENAI_KEY else '미설정'}")
+    st.text(f"🧠 모델: {OPENAI_MODEL}")
+    with st.expander("진단(키 이름만 표시)"):
+        st.write("secrets[api_keys] keys:", st.session_state["debug"]["secrets_api_keys_keys"])
+        st.write("secrets root keys:", st.session_state["debug"]["secrets_root_keys"])
+        st.write("env present:", st.session_state["debug"]["env_present"])
 
 # =========================
 # 데이터 모델
@@ -569,3 +609,4 @@ if run_btn:
 
 else:
     st.info("ISBN-13을 입력한 후 ‘분류기호 추천’을 눌러주세요.")
+
