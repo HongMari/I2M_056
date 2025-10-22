@@ -1,47 +1,30 @@
 # -*- coding: utf-8 -*-
 """
-KDC 분류기 (Streamlit secrets 기반 보안 버전)
+KDC 분류기 (ISBN -> 알라딘 -> LLM 제로샷 + 얇은 규칙 하이브리드)
+- Streamlit Secrets 기반 보안 버전 (키 비노출)
+- UI 유지 + 하단 '분류 근거(Why)' 섹션 추가
+- 정확도/안정성 패치 포함:
+  top-K JSON, 깊이 스코어, 후보 재선택기, 상위류 재시도, critic pass, validator
 """
-
-import os
 import re
 import json
-import time
 import requests
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Tuple
+
 import streamlit as st
 
 # =========================
-# 환경설정 (Secrets Manager)
-# =========================
-# secrets.toml 파일 예시:
+# 🔐 Secrets ( .streamlit/secrets.toml )
 # [api_keys]
 # aladin = "ttbdawn63091003001"
-# openai = "sk-xxxxx..."
+# openai = "sk-xxxxx"
 # openai_model = "gpt-4o-mini"
-
-try:
-    ALADIN_KEY = st.secrets["api_keys"]["aladin"]
-except Exception:
-    ALADIN_KEY = ""
-
-try:
-    OPENAI_KEY = st.secrets["api_keys"]["openai"]
-except Exception:
-    OPENAI_KEY = ""
-
-OPENAI_MODEL = st.secrets["api_keys"].get("openai_model", "gpt-4o-mini")
+# =========================
+ALADIN_KEY = st.secrets.get("api_keys", {}).get("aladin", "")
+OPENAI_KEY = st.secrets.get("api_keys", {}).get("openai", "")
+OPENAI_MODEL = st.secrets.get("api_keys", {}).get("openai_model", "gpt-4o-mini")
 OPENAI_CHAT_COMPLETIONS = "https://api.openai.com/v1/chat/completions"
-
-with st.sidebar:
-    st.markdown("### 설정")
-    st.text(f"🔑 알라딘 키: {'OK' if ALADIN_KEY else '미설정'}")
-    st.text(f"🤖 OpenAI 키: {'OK' if OPENAI_KEY else '미설정'}")
-    model = st.text_input("OpenAI 모델", value=OPENAI_MODEL)
-    st.markdown("---")
-    st.caption("환경설정은 `.streamlit/secrets.toml` 에서 관리됩니다.")
-
 
 # =========================
 # 데이터 모델
@@ -53,7 +36,7 @@ class BookInfo:
     author: str = ""
     publisher: str = ""
     pub_date: str = ""
-    category: str = ""         # 알라딘 largeCategory 문자열(있으면)
+    category: str = ""         # 알라딘 categoryName 문자열
     toc: Optional[str] = ""    # 목차
     description: Optional[str] = ""  # 책소개/설명
 
@@ -107,7 +90,6 @@ def aladin_lookup_by_api(isbn13: str) -> Optional[BookInfo]:
         date = it.get("pubDate", "")
         desc = it.get("description", "") or it.get("story", "")
         toc = it.get("toc", "")
-        # categoryName: "국내도서>문학>소설>한국소설"
         category = it.get("categoryName", "") or it.get("categoryNameEng", "")
 
         return BookInfo(
@@ -138,7 +120,7 @@ EASY_RULES = [
     (r"(반려동물|애완동물|강아지|고양이)", "595.4"),
     (r"(인테리어|홈스타일링|리모델링)", "597.3"),
     (r"(원예|가드닝|텃밭|정원)", "524.5"),
-    # 여행/지리(간단 국가/지역 키워드만)
+    # 여행/지리(간단 국가/지역 키워드)
     (r"(한국|대한민국|서울|부산|제주)\s*(여행|가이드|투어|코스)", "981"),
     (r"(일본|도쿄|오사카|교토)\s*(여행|가이드|투어|코스)", "982"),
     (r"(유럽|프랑스|파리|이탈리아|로마|스페인|바르셀로나)\s*(여행|가이드|투어|코스)", "986"),
@@ -162,26 +144,21 @@ def easy_router(title: str, desc: str) -> Optional[str]:
 # 깊이 스코어(세목 승격 판단)
 # =========================
 SPECIFIC_TERMS = [
-    # 예시: 특정 이론/도구/매체/개념
     "행동경제학", "실험경제학", "계량경제", "통계학", "인지심리", "정신분석", "DSM-5",
     "딥러닝", "머신러닝", "뉴럴네트워크", "파이썬", "텐서플로", "파이토치",
     "질적연구", "양적연구", "혼합방법", "메타분석", "케이스스터디",
 ]
-
 METHOD_OR_AUDIENCE = [
     "실험", "통계", "임상", "사례연구", "케이스스터디", "초등", "중등", "고등",
     "수험", "자격", "교재", "실무", "현장가이드", "매뉴얼", "핸드북", "프로토콜", "워크북"
 ]
-
 GEO_OR_LANGUAGE = [
     "한국", "대한민국", "서울", "부산", "제주", "영미", "영어", "일본", "중국", "독일", "프랑스",
     "일본어", "중국어", "독일어", "프랑스어", "스페인어", "러시아어", "라틴어"
 ]
-
 TEACHING_OR_EXAM = [
     "문제집", "기출", "모의고사", "자격", "수능", "토익", "토플", "CBT", "NCS", "교재", "워크북"
 ]
-
 SERIES_SIGNAL = [
     "총서", "○○총서", "학회총서", "시리즈", "리더스", "핸드북 시리즈", "가이드 시리즈"
 ]
@@ -210,8 +187,7 @@ def has_series_signal(book: BookInfo) -> bool:
     return has_any(t, SERIES_SIGNAL)
 
 def shelf_density_high(book: BookInfo) -> bool:
-    # 실제로는 분야별 소장량 지표를 연동하여 판단.
-    # 초기값은 False로 두고, 운영 로그 기반으로 점진 보정.
+    # 운영 로그 기반으로 후에 연결. 초기에는 False.
     return False
 
 def compute_depth_score(book: BookInfo) -> float:
@@ -225,8 +201,7 @@ def compute_depth_score(book: BookInfo) -> float:
     return min(score, 1.0)
 
 def require_decimal(depth_score: float) -> bool:
-    # 경험값. 운영 로그 보며 튜닝.
-    return depth_score >= 0.5
+    return depth_score >= 0.5  # 운영하며 튜닝
 
 # =========================
 # LLM 호출 (top-K JSON)
@@ -266,12 +241,9 @@ def ask_llm_for_kdc_candidates(book: BookInfo, api_key: str, model: str, k: int 
             "messages": [{"role": "system", "content": sys_prompt},
                          {"role": "user", "content": user_prompt}],
             "temperature": 0.0,
-            "max_tokens": 220
+            "max_tokens": 220,
+            "response_format": {"type": "json_object"}
         }
-
-        # 지원 모델이면 JSON 모드 지정(옵션)
-        body["response_format"] = {"type": "json_object"}
-
         resp = requests.post(OPENAI_CHAT_COMPLETIONS, headers=headers, json=body, timeout=30)
         resp.raise_for_status()
         data = resp.json()
@@ -279,25 +251,26 @@ def ask_llm_for_kdc_candidates(book: BookInfo, api_key: str, model: str, k: int 
         parsed = json.loads(txt)
         if "candidates" not in parsed:
             return {"candidates": []}
-        # sanity
         cands = parsed.get("candidates", [])
         cleaned = []
         for c in cands:
             kdc = str(c.get("kdc", "")).strip()
-            conf = float(c.get("conf", 0.5))
-            why = str(c.get("why", "")).strip()
             if not kdc:
                 continue
+            try:
+                conf = float(c.get("conf", 0.5))
+            except Exception:
+                conf = 0.5
+            why = str(c.get("why", "")).strip()
             cleaned.append({"kdc": kdc, "conf": conf, "why": why})
         return {"candidates": cleaned[:k]}
     except Exception:
         return {"candidates": []}
 
 # =========================
-# 상위류 판정 / 개론/총람 예외
+# 상위류 / 개론·총람 예외
 # =========================
 TOP_CLASSES = {"000","100","200","300","400","500","600","700","800","900"}
-
 GENERAL_WORK_HINTS = [
     "총람", "총설", "총론", "개론", "입문", "핸드북", "연감", "백과", "Encyclopedia", "개설", "전사", "통사"
 ]
@@ -321,19 +294,16 @@ def pick_final_kdc_with_log(book: BookInfo, candidates: List[Dict], depth_score:
         s = float(c.get("conf", 0.5))
         raw = s
 
-        # 세목 가산 / 상위류 페널티 / 세목 요구시 페널티
         if re.fullmatch(r"[0-9]{3}", k):
-            s -= 0.08
+            s -= 0.08                  # 상위류 페널티
         if re.fullmatch(r"[0-9]{3}\.[0-9]+", k):
-            s += 0.06
+            s += 0.06                  # 세목 가산
         if need_decimal and re.fullmatch(r"[0-9]{3}", k):
-            s -= 0.15
+            s -= 0.15                  # 세목 요구인데 3자리면 페널티
 
-        # 문학에서 800/810만 나오면 페널티
         if "소설" in (book.title or "") and k in {"800", "810"}:
-            s -= 0.25
+            s -= 0.25                  # 문학 상위만 제시 시 페널티
 
-        # 보조 신호 가중
         s += 0.02 * sum([
             has_geo_or_language(book),
             has_method_or_audience(book),
@@ -350,13 +320,9 @@ def pick_final_kdc_with_log(book: BookInfo, candidates: List[Dict], depth_score:
     return chosen, logs
 
 # =========================
-# critic pass / 검증기
+# critic / validator / 재시도
 # =========================
 def critic_check(book: BookInfo, final_code: Optional[str], candidates: List[Dict]) -> Tuple[bool, str]:
-    """
-    간단 critic: 최종 코드가 상위류로만 나왔는데 총람/개론도 아니면 경고.
-    (추가로 LLM에 '요목과 모순 여부'를 재질의하는 2차 호출을 넣을 수도 있음.)
-    """
     if not final_code:
         return False, "코드 없음"
     if is_top_class(final_code) and not is_true_general_work(book):
@@ -372,16 +338,9 @@ def validate_code(kdc_code: Optional[str]) -> Dict:
         "message": None if ok_syntax else "형식 오류: 3자리 또는 3자리+소수점(1~2) 필요"
     }
 
-# =========================
-# 재시도(세목 강제 프롬프트)
-# =========================
 def retry_with_stronger_prompt_for_decimal(book: BookInfo, api_key: str, model: str) -> Optional[str]:
-    """
-    상위류만 반환된 경우, '세목(소수점) 필수'를 강제한 짧은 재질의.
-    """
     if not api_key:
         return None
-
     sys_prompt = (
         "너는 한국십진분류(KDC) 전문가다. 반드시 소수점 세목을 제시하라. "
         "총람/사전/연감/개론이 아닌 이상 상위류(000·100…·900) 단독 답변은 금지한다. "
@@ -395,7 +354,7 @@ def retry_with_stronger_prompt_for_decimal(book: BookInfo, api_key: str, model: 
         "이 자료의 KDC 세목(소수점 포함)을 숫자만 출력."
     )
     try:
-        headers = {"Authorization": f"Bearer {OPENAI_KEY}", "Content-Type": "application/json"}
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
         body = {
             "model": model,
             "messages": [{"role": "system", "content": sys_prompt},
@@ -407,14 +366,13 @@ def retry_with_stronger_prompt_for_decimal(book: BookInfo, api_key: str, model: 
         resp.raise_for_status()
         data = resp.json()
         txt = safe_get(data, "choices", 0, "message", "content", default="").strip()
-        # 숫자만 필터
         m = re.search(r"[0-9]{3}\.[0-9]{1,2}|[0-9]{3}", txt)
         return m.group(0) if m else None
     except Exception:
         return None
 
 # =========================
-# Evidence 컨테이너
+# Evidence 컨테이너 & 메인 분류
 # =========================
 def build_evidence() -> Dict:
     return {
@@ -428,9 +386,6 @@ def build_evidence() -> Dict:
         "final": {}
     }
 
-# =========================
-# 메인 분류 함수 (final + evidence 반환)
-# =========================
 def classify_kdc(book_info: BookInfo, openai_key: str, model: str) -> Tuple[Optional[str], Dict]:
     ev = build_evidence()
     ev["input"] = {
@@ -490,7 +445,7 @@ def classify_kdc(book_info: BookInfo, openai_key: str, model: str) -> Tuple[Opti
     return final, ev
 
 # =========================
-# Streamlit UI
+# Streamlit UI (UI 유지 + 하단 근거 표시)
 # =========================
 st.set_page_config(page_title="KDC 분류기 자동 추천", page_icon="📚", layout="wide")
 
@@ -499,14 +454,13 @@ st.caption("ISBN → 알라딘 → LLM 제로샷 + 얇은 규칙 하이브리드
 
 with st.sidebar:
     st.markdown("### 설정")
-    st.write("환경변수로 API 키를 읽습니다.")
-    st.text(f"ALADIN_TTB_KEY: {'OK' if ALADIN_KEY else '미설정'}")
-    st.text(f"OPENAI_API_KEY: {'OK' if OPENAI_KEY else '미설정'}")
+    st.text(f"🔑 알라딘 키: {'OK' if ALADIN_KEY else '미설정'}")
+    st.text(f"🤖 OpenAI 키: {'OK' if OPENAI_KEY else '미설정'}")
     model = st.text_input("OpenAI 모델", value=OPENAI_MODEL)
     st.markdown("---")
-    st.markdown("**Tip**: 설명/목차가 충분할수록 정확도가 높아집니다.")
+    st.caption("환경설정은 `.streamlit/secrets.toml` 에서 관리됩니다.")
 
-# 입력 영역 (UI는 유지)
+# 입력 영역 (UI 유지)
 isbn_input = st.text_input("ISBN-13 입력", value="", placeholder="예: 9788934939603")
 run_btn = st.button("분류기호 추천")
 
@@ -615,4 +569,3 @@ if run_btn:
 
 else:
     st.info("ISBN-13을 입력한 후 ‘분류기호 추천’을 눌러주세요.")
-
