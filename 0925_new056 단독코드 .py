@@ -1,7 +1,8 @@
-# new056.py (KDC3 내장: 류·강·목 3자리 전체 + EA 자리앵커 + 알라딘 + 요목표 강제 + 근거표)
+# new056.py (KDC3 내장 + EA 자리앵커 + 알라딘 + 요목표 강제 + 제너릭 라벨 필터 + 근거표)
 # - KDC3를 코드에 내장(000~999 전부 키 존재) → 일부 대표 3자리는 정확 라벨/키워드, 나머지는 자동확장으로 "류 일반/세부" 처리
 # - EA_ADD_CODE 뒤 3자리에서 0이 아닌 각 자리(백/십/일)를 앵커로 고정
 # - 알라딘에서 서지 확보 → 챗G는 '허용 3자리(요목표)' 목록 안에서만 선택하도록 강제
+# - "세부/일반" 같은 제너릭 라벨은 LLM 허용목록·미리보기·규칙 점수에서 최대한 배제(필요 시 최소 보충)
 # - LLM 출력 사후검증 + 규칙기반(요목표 키워드 매칭) 근거 표 제공
 # - 기존 UI 유지
 
@@ -102,7 +103,6 @@ _KDC_HUNDREDS = {
     "9": {"label": "역사",   "terms": ["역사","세계사","한국사","중국사","일본사","유럽사","아프리카사","아메리카사","오세아니아","지리","전기","지도"]},
 }
 
-# 대표 3자리(강·목) — 정확 라벨/키워드 내장 (핵심 위주, 필요시 지속 확장 가능)
 _KDC_EXPLICIT_3 = {
     # 000대
     "000":{"label":"총류","terms":["총류","일반","지식"]},
@@ -253,6 +253,38 @@ def _auto_expand_kdc3(explicit_map: dict, hundreds_map: dict) -> dict:
 
 # 실행 시 전체(000~999) 3자리 사전 완성
 KDC3: Dict[str, Dict[str, Any]] = _auto_expand_kdc3(_KDC_EXPLICIT_3, _KDC_HUNDREDS)
+
+# === NEW: 제너릭 라벨 여부 판단 ===
+def _is_generic_label(label: str) -> bool:
+    if not label:
+        return True
+    lbl = str(label)
+    return ("세부" in lbl) or ("일반" in lbl)
+
+# === NEW: LLM용 허용목록(의미 있는 라벨 위주) 구성 ===
+def build_allowed_for_llm(allowed_all: Dict[str, Dict[str,Any]],
+                          anchors: Dict[str, Optional[str]],
+                          min_keep: int = 12) -> Dict[str, Dict[str,Any]]:
+    """
+    1) 의미 있는 라벨(세부/일반 아닌 것)만 우선 채택
+    2) 너무 적으면(앵커로 과도히 좁혀진 경우) 제너릭 일부를 보충
+    """
+    meaningful = {k:v for k,v in allowed_all.items() if not _is_generic_label(v.get("label",""))}
+    if len(meaningful) >= min_keep:
+        return meaningful
+
+    generic = {k:v for k,v in allowed_all.items() if k not in meaningful}
+    # 우선순위: (십/일 자리가 0이 아닌 코드) > 나머지
+    def _generic_rank(code: str) -> tuple:
+        return ((code[1] != "0") + (code[2] != "0"), code)  # 세분도, 코드정렬
+    generic_sorted = dict(sorted(generic.items(), key=lambda kv: _generic_rank(kv[0]), reverse=True))
+
+    out = dict(meaningful)
+    for k, v in generic_sorted.items():
+        out[k] = v
+        if len(out) >= min_keep:
+            break
+    return out if out else allowed_all
 
 def outline_slice_by_anchors(anc: Dict[str, Optional[str]]) -> Dict[str, Dict[str, Any]]:
     """자리앵커(백/십/일) 제약으로 KDC3 허용 집합 필터."""
@@ -481,6 +513,9 @@ def score_outline_candidates(info: BookInfo, allowed: Dict[str, Dict[str,Any]]) 
         s = 0.0
         for h in hits:
             s += (2.0 if h.lower() in t else 0.0) + (1.5 if h.lower() in c else 0.0) + (1.0 if h.lower() in d else 0.0)
+        # === 제너릭 라벨 패널티 ===
+        if _is_generic_label(spec.get("label","")):
+            s *= 0.6  # 40% 패널티
         scored.append({"code": code3, "label": spec.get("label",""), "hits": hits, "score": s})
     if scored:
         mx = max(x["score"] for x in scored) or 1.0
@@ -609,25 +644,27 @@ def get_kdc_from_isbn(isbn13: str, ttbkey: Optional[str], openai_key: str, model
                 "allowed_size": 0, "allowed_preview": "", "outline_rank": None}
 
     # 2) 허용 가능한 3자리(요목표) 집합 구성 (자리앵커로 필터)
-    allowed = outline_slice_by_anchors(anchors)
-    allowed_set = set(allowed.keys())
-    allowed_preview = allowed_outline_hint(allowed, limit=30)
+    allowed_all = outline_slice_by_anchors(anchors)
+    allowed_for_llm = build_allowed_for_llm(allowed_all, anchors, min_keep=12)
 
-    # 3) 규칙 기반(요목표) 후보 — 근거용
-    outline_rank = score_outline_candidates(info, allowed)
+    allowed_set_all = set(allowed_all.keys())
+    allowed_preview = allowed_outline_hint(allowed_for_llm, limit=30)
 
-    # 4) LLM: 허용 3자리 강제
+    # 3) 규칙 기반(요목표) 후보 — 근거용은 '의미 있는 라벨'을 우선 활용
+    outline_rank = score_outline_candidates(info, allowed_for_llm)
+
+    # 4) LLM: 허용 3자리 강제(정제된 목록 사용)
     llm_raw = ask_llm_for_kdc_with_allowed(info, api_key=openai_key, model=model,
-                                           anchors=anchors, allowed=allowed)
+                                           anchors=anchors, allowed=allowed_for_llm)
     code = enforce_anchor_digits(llm_raw, anchors)
 
-    # 5) 사후검증: 허용목록 위반 시 보정(규칙 최고 후보로 대체)
+    # 5) 사후검증: 허용목록(전체 allowed_all 기준) 위반 시 보정
     head3 = None
     if code:
         m = re.match(r"^(\d{3})", code)
         if m:
             head3 = m.group(1)
-    if code and head3 not in allowed_set:
+    if code and head3 not in allowed_set_all:
         st.warning(f"LLM 결과({code})의 기본 3자리 {head3}가 허용 목록에 없음 → 규칙 기반 최고 후보로 보정")
         if outline_rank:
             best = outline_rank[0]["code"]
@@ -638,12 +675,12 @@ def get_kdc_from_isbn(isbn13: str, ttbkey: Optional[str], openai_key: str, model
             code = best + (tail or "")
             head3 = best
         else:
-            fallback = sorted(list(allowed_set))[0] if allowed_set else None
+            fallback = sorted(list(allowed_set_all))[0] if allowed_set_all else None
             code = fallback or code
 
     # 6) LLM 후보(근거표) 생성
     ranking = ask_llm_for_kdc_ranking(info, api_key=openai_key, model=model,
-                                      anchors=anchors, allowed=allowed)
+                                      anchors=anchors, allowed=allowed_for_llm)
 
     # 7) 디버그 입력
     with st.expander("LLM 입력 정보(확인용)"):
@@ -652,14 +689,14 @@ def get_kdc_from_isbn(isbn13: str, ttbkey: Optional[str], openai_key: str, model
             "isbn13": info.isbn13, "category": info.category,
             "description": (info.description[:600] + "…") if info.description and len(info.description) > 600 else info.description,
             "toc": info.toc, "ea_add_last3": last3, "anchors": anchors,
-            "allowed_size": len(allowed_set), "allowed_preview": allowed_preview,
+            "allowed_size": len(allowed_for_llm), "allowed_preview": allowed_preview,
             "llm_raw": llm_raw, "final_code": code
         })
 
     signals = {"title": info.title[:120], "category": info.category[:120], "author": info.author[:80], "publisher": info.publisher[:80]}
     return {"code": code, "anchors": anchors, "ea_add_last3": last3, "ranking": ranking,
             "signals": signals, "llm_raw": llm_raw,
-            "allowed_size": len(allowed_set), "allowed_preview": allowed_preview,
+            "allowed_size": len(allowed_for_llm), "allowed_preview": allowed_preview,
             "outline_rank": outline_rank}
 
 # ───────── UI ─────────
