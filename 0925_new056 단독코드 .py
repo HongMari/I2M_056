@@ -1,27 +1,51 @@
-# new058.py (EA_ADD_CODE + 알라딘 세목 조합형 + 결정경로 시각화)
+# new056.py
 
-import os, re, json, html, urllib.parse
+import os
+import re
+import json
+import html
+import urllib.parse
 from dataclasses import dataclass
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any
+from bs4 import BeautifulSoup
 from pathlib import Path
 
 import requests
 import streamlit as st
-from bs4 import BeautifulSoup
 
 # ───────────────────────────────────────────────────────────────
-# Streamlit 설정
+# Streamlit 기본 설정 (제일 위에서 딱 1번만!)
 # ───────────────────────────────────────────────────────────────
-st.set_page_config(page_title="ISBN → KDC 추천(세목까지)", page_icon="📚", layout="centered")
+st.set_page_config(
+    page_title="ISBN → KDC 추천",
+    page_icon="📚",
+    layout="centered"
+)
 
 # ───────── 상수/설정 ─────────
 DEFAULT_MODEL = "gpt-4o-mini"
 ALADIN_LOOKUP_URL = "https://www.aladin.co.kr/ttb/api/ItemLookUp.aspx"
-NLK_API_URL = "https://nl.go.kr/NL/search/openApi/search.do"   # [NEW]
-HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; KDCFetcher/1.2; +https://example.local)"}
+ALADIN_SEARCH_URL = "https://www.aladin.co.kr/search/wsearchresult.aspx"
+OPENAI_CHAT_COMPLETIONS = "https://api.openai.com/v1/chat/completions"
 
-# ───────── secrets.toml or env ─────────
+with st.expander("환경설정 디버그", expanded=True):
+    from pathlib import Path
+    st.write("📁 앱 폴더:", Path(__file__).resolve().parent.as_posix())
+    st.write("🔎 secrets.toml 존재?:", (Path(__file__).resolve().parent / ".streamlit" / "secrets.toml").exists())
+    st.write("🔑 st.secrets 키들:", list(st.secrets.keys()))
+    st.write("api_keys 내용:", dict(st.secrets.get("api_keys", {})))
+    st.write("✅ openai_key 로드됨?:", bool(st.secrets.get("api_keys", {}).get("openai_key")))
+    st.write("✅ aladin_key 로드됨?:", bool(st.secrets.get("api_keys", {}).get("aladin_key")))
+
+
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; KDCFetcher/1.0; +https://example.local)"
+}
+
+# ───────── secrets.toml 우선 사용, 없으면 환경변수 fallback ─────────
 def _get_secret(*path, default=""):
+    """st.secrets에서 중첩 경로를 안전하게 꺼내는 유틸."""
     try:
         v = st.secrets
         for p in path:
@@ -30,55 +54,68 @@ def _get_secret(*path, default=""):
     except Exception:
         return default
 
+# 지금 사용하는 secrets.toml 구조에 맞춤 ([api_keys].openai_key / aladin_key)
 OPENAI_API_KEY = (
-    _get_secret("api_keys", "openai_key")
-    or _get_secret("OPENAI_API_KEY")
+    _get_secret("api_keys", "openai_key") 
     or os.environ.get("OPENAI_API_KEY", "")
 )
+
 ALADIN_TTBKEY = (
-    _get_secret("api_keys", "aladin_key")
-    or _get_secret("ALADIN_TTB_KEY")
+    _get_secret("api_keys", "aladin_key") 
     or os.environ.get("ALADIN_TTBKEY", "")
-)
-NLK_API_KEY = (
-    _get_secret("api_keys", "nlk_key")  # [NEW]
-    or _get_secret("NLK_API_KEY")
-    or os.environ.get("NLK_API_KEY", "")
 )
 
 MODEL = DEFAULT_MODEL
 
-# ───────── 환경설정 디버그 ─────────
-def _mask(v: str, keep: int = 4) -> str:
-    if not v: return ""
-    v = str(v)
-    if len(v) <= keep: return "*" * len(v)
-    return "*" * (len(v) - keep) + v[-keep:]
 
-with st.expander("⚙️ 환경설정 디버그", expanded=True):
-    st.write("📁 앱 폴더:", Path(__file__).resolve().parent.as_posix())
+# 국립중앙도서관 API 키 (seoji SearchApi)
+NLK_API_KEY = (
+    _get_secret("api_keys", "nlk_key")
+    or os.environ.get("NLK_API_KEY", "")
+)
+
+def nlk_lookup_ea_add_code(isbn13: str, cert_key: str = NLK_API_KEY) -> Optional[str]:
+    """국립중앙도서관 서지 SearchApi로 EA_ADD_CODE 조회.
+    반환: 5자리 문자열(예: '00083') 또는 None
+    """
+    if not cert_key:
+        return None
     try:
-        top_keys = list(st.secrets.keys())
-        st.write("🔑 secrets 최상위 키 목록:", top_keys)
+        url = "https://www.nl.go.kr/seoji/SearchApi.do"
+        params = {
+            "cert_key": cert_key,
+            "result_style": "json",
+            "page_no": 1,
+            "page_size": 10,
+            "isbn": isbn13,
+        }
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        docs = data.get("docs") or data.get("items") or []
+        for d in docs:
+            ea = d.get("EA_ADD_CODE") or d.get("ea_add_code") or d.get("EA_ADD_CD")
+            if ea:
+                ea = str(ea).strip()
+                if len(ea) >= 5 and ea.isdigit():
+                    return ea[-5:]
+        return None
+    except Exception as e:
+        st.info(f"NLK SearchApi EA_ADD_CODE 조회 실패: {e}")
+        return None
 
-        # 섹션 내부도 함께 표시(마스킹)
-        api_keys = dict(st.secrets.get("api_keys", {}))
-        if api_keys:
-            st.write("🔎 [api_keys] 섹션 내용(마스킹):", {
-                k: _mask(api_keys.get(k, "")) for k in api_keys
-            })
-        else:
-            st.write("🔎 [api_keys] 섹션 없음 또는 비어있음")
 
+def _anchor_hundreds_from_ea(ea_add_code: str) -> Optional[str]:
+    """EA_ADD_CODE의 뒤 3자리를 이용해 류(첫 자리 수)를 계산해 '0~9' 문자열 반환"""
+    try:
+        tail3 = f"{int(ea_add_code[-3:]):03d}"
+        return tail3[0]  # ex) '813' -> '8'
     except Exception:
-        st.write("secrets 접근 불가(로컬 실행 중일 수 있음)")
+        return None
 
-    # 로드 여부 플래그
-    st.write("✅ OPENAI 키 로드됨?:", bool(OPENAI_API_KEY))
-    st.write("✅ ALADIN 키 로드됨?:", bool(ALADIN_TTBKEY))
-    st.write("✅ 국립중앙도서관(NLK) 키 로드됨?:", bool(NLK_API_KEY))
-    
-# ───────── 데이터 구조 ─────────
+
+
+
 @dataclass
 class BookInfo:
     title: str = ""
@@ -99,20 +136,20 @@ def clean_text(s: Optional[str]) -> str:
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
-def normalize_code(code: str) -> str:
-    if not code:
-        return ""
-    m = re.match(r"^\s*(\d{1,3})(\.\d+)?\s*$", code)
-    if not m:
-        return ""
-    head = m.group(1).zfill(3)
-    tail = m.group(2) or ""
-    if tail and re.match(r"^\.\d+$", tail):
-        tail = re.sub(r"0+$", "", tail)
-        if tail == ".": tail = ""
-    return head + tail
+def first_match_number(text: str) -> Optional[str]:
+    """KDC 숫자만 추출: 0~999 또는 소수점 포함(예: 813.7)"""
+    if not text:
+        return None
+    m = re.search(r"\b([0-9]{1,3}(?:\.[0-9]+)?)\b", text)
+    return m.group(1) if m else None
 
-# ───────── 1) 알라딘 API ─────────
+def first_or_empty(lst):
+    return lst[0] if lst else ""
+
+def strip_tags(html_text: str) -> str:
+    return re.sub(r"<[^>]+>", " ", html_text)
+
+# ───────── 1) 알라딘 API 우선 ─────────
 def aladin_lookup_by_api(isbn13: str, ttbkey: str) -> Optional[BookInfo]:
     if not ttbkey:
         return None
@@ -122,14 +159,17 @@ def aladin_lookup_by_api(isbn13: str, ttbkey: str) -> Optional[BookInfo]:
         "ItemId": isbn13,
         "output": "js",
         "Version": "20131101",
-        "OptResult": "authors,categoryName,fulldescription,toc"
+        "OptResult": "authors,categoryName,fulldescription,toc,packaging,ratings"
     }
     try:
         r = requests.get(ALADIN_LOOKUP_URL, params=params, headers=HEADERS, timeout=15)
         r.raise_for_status()
         data = r.json()
         items = data.get("item", [])
-        if not items: return None
+        if not items:
+            # 디버그: API가 비어있으면 이유를 화면에서 확인할 수 있게
+            st.info("알라딘 API(ItemLookUp)에서 결과 없음 → 스크레이핑 백업 시도")
+            return None
         it = items[0]
         return BookInfo(
             title=clean_text(it.get("title")),
@@ -142,158 +182,233 @@ def aladin_lookup_by_api(isbn13: str, ttbkey: str) -> Optional[BookInfo]:
             toc=clean_text(it.get("toc")),
             extra=it,
         )
-    except Exception:
-        return None
-
-# ───────── 2) 국립중앙도서관 EA_ADD_CODE ─────────
-def get_ea_add_code(isbn13: str, api_key: str) -> Optional[str]:
-    if not api_key:
-        return None
-    params = {"key": api_key, "apiType": "xml", "systemType": "main", "isbn": isbn13, "pageSize": 1}
-    try:
-        r = requests.get(NLK_API_URL, params=params, headers=HEADERS, timeout=15)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "xml")
-        ea_tag = soup.find("EA_ADD_CODE")
-        if ea_tag and ea_tag.text:
-            return ea_tag.text.strip()
-        return None
     except Exception as e:
-        st.warning(f"국립중앙도서관 API 오류: {e}")
+        st.info(f"알라딘 API 호출 예외 → {e} / 스크레이핑 백업 시도")
         return None
 
-def extract_kdc_from_ea(ea_code: str) -> Optional[str]:
-    if not ea_code:
+
+# ───────── 2) 알라딘 웹 스크레이핑(백업) ─────────
+
+
+def aladin_lookup_by_web(isbn13: str) -> Optional[BookInfo]:
+    try:
+        # 검색 URL (Book 타겟 우선)
+        params = {"SearchTarget": "Book", "SearchWord": f"isbn:{isbn13}"}
+        sr = requests.get(ALADIN_SEARCH_URL, params=params, headers=HEADERS, timeout=15)
+        sr.raise_for_status()
+
+        soup = BeautifulSoup(sr.text, "html.parser")
+
+        # 1) 가장 안정적인 카드 타이틀 링크 (a.bo3)
+        link_tag = soup.select_one("a.bo3")
+        item_url = None
+        if link_tag and link_tag.get("href"):
+            item_url = urllib.parse.urljoin("https://www.aladin.co.kr", link_tag["href"])
+
+        # 2) 백업: 정규식으로 wproduct 링크 잡기(쌍/홑따옴표 모두)
+        if not item_url:
+            m = re.search(r'href=[\'"](/shop/wproduct\.aspx\?ItemId=\d+[^\'"]*)[\'"]', sr.text, re.I)
+            if m:
+                item_url = urllib.parse.urljoin("https://www.aladin.co.kr", html.unescape(m.group(1)))
+
+        # 3) 그래도 없으면, 첫 상품 카드 내 다른 링크 시도
+        if not item_url:
+            first_card = soup.select_one(".ss_book_box, .ss_book_list")
+            if first_card:
+                a = first_card.find("a", href=True)
+                if a:
+                    item_url = urllib.parse.urljoin("https://www.aladin.co.kr", a["href"])
+
+        if not item_url:
+            st.warning("알라딘 검색 페이지에서 상품 링크를 찾지 못했습니다.")
+            with st.expander("디버그: 검색 페이지 HTML 일부"):
+                st.code(sr.text[:2000])
+            return None
+
+        # 상품 상세 페이지 요청
+        pr = requests.get(item_url, headers=HEADERS, timeout=15)
+        pr.raise_for_status()
+        psoup = BeautifulSoup(pr.text, "html.parser")
+
+        # 메타 태그로 기본 정보 확보
+        og_title = psoup.select_one('meta[property="og:title"]')
+        og_desc  = psoup.select_one('meta[property="og:description"]')
+        title = clean_text(og_title["content"]) if og_title and og_title.has_attr("content") else ""
+        desc  = clean_text(og_desc["content"]) if og_desc and og_desc.has_attr("content") else ""
+
+        # 본문 텍스트 백업(길이 제한)
+        body_text = clean_text(psoup.get_text(" "))[:4000]
+        description = desc or body_text
+
+        # 저자/출판사/출간일 추출(있으면)
+        author = ""
+        publisher = ""
+        pub_date = ""
+        cat_text = ""
+
+        # 상품 정보 표에서 키워드로 추출 시도
+        info_box = psoup.select_one("#Ere_prod_allwrap, #Ere_prod_mconts_wrap, #Ere_prod_titlewrap")
+        if info_box:
+            text = clean_text(info_box.get_text(" "))
+            # 아주 느슨한 패턴(있을 때만 잡힘)
+            m_author = re.search(r"(저자|지은이)\s*:\s*([^\|·/]+)", text)
+            m_publisher = re.search(r"(출판사)\s*:\s*([^\|·/]+)", text)
+            m_pubdate = re.search(r"(출간일|출판일)\s*:\s*([0-9]{4}\.[0-9]{1,2}\.[0-9]{1,2})", text)
+            if m_author:   author   = clean_text(m_author.group(2))
+            if m_publisher: publisher = clean_text(m_publisher.group(2))
+            if m_pubdate:  pub_date = clean_text(m_pubdate.group(2))
+
+        # 카테고리(빵부스러기) 시도
+        crumbs = psoup.select(".location, .path, .breadcrumb")
+        if crumbs:
+            cat_text = clean_text(" > ".join(c.get_text(" ") for c in crumbs))
+
+        # 디버그: 어느 링크로 들어갔는지/타이틀 확인
+        with st.expander("디버그: 스크레이핑 진입 URL / 파싱 결과"):
+            st.write({"item_url": item_url, "title": title})
+        
+        return BookInfo(
+            title=title,
+            description=description,
+            isbn13=isbn13,
+            author=author,
+            publisher=publisher,
+            pub_date=pub_date,
+            category=cat_text
+        )
+    except Exception as e:
+        st.error(f"웹 스크레이핑 예외: {e}")
         return None
-    m = re.search(r"(\d{3})$", ea_code)
-    if m:
-        return m.group(1)
-    return None
 
-# ───────── 3) EA + 알라딘 조합 ─────────
-def combine_ea_aladin(ea_kdc: Optional[str], book: BookInfo) -> (Optional[str], str):
-    """EA_ADD_CODE 기반 KDC에 알라딘 category/description 세목(.x) 보정."""
-    if not ea_kdc:
-        return None, "EA_ADD_CODE 없음 → 분류 불가"
 
-    base = ea_kdc.strip()
-    cat = (book.category or "").lower()
-    desc = (book.description or "").lower()
-    title = (book.title or "").lower()
+# ───────── 3) 챗G에게 'KDC 숫자만' 요청 ─────────
+def ask_llm_for_kdc(book: BookInfo, api_key: str, model: str = DEFAULT_MODEL, anchor_hundreds: Optional[str] = None) -> Optional[str]:
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY가 필요합니다. 사이드바 또는 환경변수로 입력하세요.")
+    constrain = ""
+    if anchor_hundreds and anchor_hundreds.isdigit() and len(anchor_hundreds) == 1:
+        constrain = f" 반드시 분류기호의 '류(첫 자리 수)'는 {anchor_hundreds}로 시작해야 한다. (예: {anchor_hundreds}00대)"
+    sys_prompt = (
+        "너는 한국 십진분류(KDC) 전문가다. "
+        "아래 도서 정보를 보고 KDC 분류기호를 '숫자만' 출력해라. "
+        "형식 예시: 813.7 / 325.1 / 005 / 181 등. "
+        "설명, 접두/접미 텍스트, 기타 문자는 절대 출력하지 마라." + constrain
+    )
+    payload = {
+        "title": book.title,
+        "author": book.author,
+        "publisher": book.publisher,
+        "pub_date": book.pub_date,
+        "isbn13": book.isbn13,
+        "category": book.category,
+        "description": book.description,
+        "toc": book.toc,
+    }
+    user_prompt = (
+        "도서 정보:\n"
+        + json.dumps(payload, ensure_ascii=False, indent=2)
+        + "\n\nKDC 숫자만 출력:"
+    )
 
-    # 결정경로 추적용 메시지
-    trace = f"EA기반 {base} → "
+    try:
+        resp = requests.post(
+            OPENAI_CHAT_COMPLETIONS,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": 0.1,
+                "max_tokens": 32,
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        msg = ((data.get("choices") or [{}])[0].get("message") or {}).get("content", "")
+        code = re.findall(r"[0-9]{1,3}(?:\.[0-9]+)?", msg)
+        code = code[0] if code else ""
+        code = code.strip()
+        if not code:
+            return None
+        if anchor_hundreds and code and code[0].isdigit() and code[0] != anchor_hundreds:
+            code = anchor_hundreds + code[1:]
+        return code
+    except Exception as e:
+        st.error(f"LLM 호출 오류: {e}")
+        return None
 
-    # 문학류
-    if base.startswith("81"):
-        if "현대" in cat or "198" in desc:
-            trace += "알라딘 카테고리 '현대' 감지 → .7 부여"
-            return base + ".7", trace
-        if "고전" in cat or "조선" in desc:
-            trace += "알라딘 카테고리 '고전' 감지 → .3 부여"
-            return base + ".3", trace
-        if any(k in (cat + title) for k in ["에세이", "수필", "산문"]):
-            trace += "문학형식 '에세이' 감지 → 816.7로 보정"
-            return "816.7", trace
-        trace += "추가 조건 없음 → EA 값 유지"
-        return base, trace
+# ───────── 4) 파이프라인 ─────────
+def get_kdc_from_isbn(isbn13: str, ttbkey: Optional[str], openai_key: str, model: str) -> Optional[str]:
+    # 0) NLK EA_ADD_CODE로 '류' 앵커 확보
+    ea = nlk_lookup_ea_add_code(isbn13)
+    anchor_hundreds = None
+    if ea:
+        try:
+            # EA_ADD_CODE 뒤 3자리 → 분류기호 → 첫 자리만 앵커로 사용
+            tail3 = f"{int(ea[-3:]):03d}"
+            anchor_hundreds = tail3[0]
+            st.caption(f"🔒 EA_ADD_CODE={ea} → 앵커 류={anchor_hundreds}00대 (분류기호 {tail3} 기반)")
+        except Exception:
+            anchor_hundreds = None
 
-    # 철학
-    if base.startswith("18"):
-        if "윤리" in cat or "도덕" in desc:
-            trace += "철학 하위 '윤리' 감지 → .1 부여"
-            return base + ".1", trace
-        if "동양" in cat or "불교" in desc:
-            trace += "철학 하위 '동양' 감지 → .2 부여"
-            return base + ".2", trace
-        trace += "기타 철학 서적 → EA 유지"
-        return base, trace
-
-    # 사회과학
-    if base.startswith("32"):
-        if "복지" in cat or "정책" in cat:
-            trace += "사회 하위 '복지·정책' 감지 → .3 부여"
-            return base + ".3", trace
-        if "교육" in cat:
-            trace += "사회 하위 '교육' 감지 → 370 부여"
-            return "370", trace
-        trace += "기타 사회과학 → EA 유지"
-        return base, trace
-
-    # 과학/기술
-    if base.startswith(("50", "51", "52", "60")):
-        if "컴퓨터" in desc or "프로그래밍" in desc:
-            trace += "기술 분야 '컴퓨터' 감지 → 005 부여"
-            return "005", trace
-        if "의학" in desc or "간호" in desc:
-            trace += "기술 분야 '의학' 감지 → 510 부여"
-            return "510", trace
-        trace += "과학기술 일반 → EA 유지"
-        return base, trace
-
-    trace += "특별조건 없음 → EA 유지"
-    return base, trace
-
-# ───────── 4) 하이브리드 파이프라인 ─────────
-def get_kdc_from_isbn_hybrid(isbn13: str, ttbkey: Optional[str],
-                              nlk_key: Optional[str] = "") -> Dict[str, Any]:
-    """EA_ADD_CODE(류·강·목) + 알라딘 세목 결합 + 결정경로 반환"""
-    ea_code = get_ea_add_code(isbn13, nlk_key)
-    ea_kdc = extract_kdc_from_ea(ea_code) if ea_code else None
+    # 1) 알라딘 정보
     info = aladin_lookup_by_api(isbn13, ttbkey) if ttbkey else None
-    if not info: 
-        return {"final": None, "trace": "알라딘 정보 없음", "ea_kdc": ea_kdc, "ea_code": ea_code, "book": None}
+    if not info:
+        info = aladin_lookup_by_web(isbn13)
+    if not info:
+        st.warning("알라딘에서 도서 정보를 찾지 못했습니다.")
+        return None
 
-    combined_kdc, trace = combine_ea_aladin(ea_kdc, info)
-    return {"final": combined_kdc, "trace": trace, "ea_kdc": ea_kdc, "ea_code": ea_code, "book": info}
+    # 2) LLM 판단 (앵커 류 고정)
+    code = ask_llm_for_kdc(info, api_key=openai_key, model=model, anchor_hundreds=anchor_hundreds)
+
+    # 3) 디버그: 어떤 정보를 넘겼는지 공개
+    with st.expander("LLM 입력 정보(확인용)"):
+        st.json({
+            "title": info.title,
+            "author": info.author,
+            "publisher": info.publisher,
+            "pub_date": info.pub_date,
+            "isbn13": info.isbn13,
+            "category": info.category,
+            "description": (info.description[:600] + "…") if info.description and len(info.description) > 600 else info.description,
+            "toc": info.toc,
+            "ea_anchor_hundreds": anchor_hundreds
+        })
+    return code
+
 
 # ───────── UI ─────────
-st.title("📚 ISBN → KDC 추천 (EA_ADD_CODE + 알라딘 세목 조합)")
-st.caption("국립중앙도서관 EA_ADD_CODE로 대분류 확정 → 알라딘 데이터로 세목(.x) 보정")
+st.title("📚 ISBN → KDC 추천 (알라딘 + 챗G)")
+st.caption("ISBN을 입력하면 알라딘에서 도서 정보를 가져와 챗G에게 넘기고, **KDC 분류기호 숫자만** 받아옵니다.")
 
-isbn = st.text_input("ISBN-13 입력", placeholder="예: 9788936433598").strip()
+
+
+isbn = st.text_input("ISBN-13 입력", placeholder="예: 9791193904565").strip()
 go = st.button("분류기호 추천")
 
 if go:
     if not isbn:
         st.warning("ISBN을 입력하세요.")
     else:
-        with st.spinner("EA_ADD_CODE + 알라딘 정보 수집 중…"):
-            out = get_kdc_from_isbn_hybrid(
+        with st.spinner("알라딘에서 정보 수집 → 챗G 판단 중…"):
+            code = get_kdc_from_isbn(
                 isbn13=isbn,
                 ttbkey=ALADIN_TTBKEY,
-                nlk_key=NLK_API_KEY,
+                openai_key=OPENAI_API_KEY,
+                model=MODEL,
             )
 
-        info: BookInfo = out.get("book")
-        final_code = out.get("final")
-
         st.subheader("결과")
-        if final_code:
-            st.markdown(f"### ✅ 최종 KDC 추천: **`{final_code}`**")
+        if code:
+            st.markdown(f"### ✅ 추천 KDC: **`{code}`**")
+            st.caption("※ 숫자만 반환하도록 강제했으며, 소수점 이하 세분은 모델 판단에 따라 포함될 수 있습니다.")
         else:
-            st.error("분류기호 추천에 실패했습니다.")
-
-        # EA 정보
-        with st.expander("📘 EA_ADD_CODE 및 조합 정보"):
-            st.json({
-                "EA_ADD_CODE": out.get("ea_code"),
-                "EA기반KDC(류·강·목)": out.get("ea_kdc"),
-                "최종조합(KDC 세목포함)": out.get("final")
-            })
-
-        # [NEW] 결정 경로 카드
-        st.markdown("#### 🧩 KDC 결정 경로 요약")
-        st.info(out.get("trace") or "결정 경로 정보 없음")
-
-        if info:
-            with st.expander("📖 도서 정보(알라딘)"):
-                st.json({
-                    "title": info.title,
-                    "author": info.author,
-                    "publisher": info.publisher,
-                    "pub_date": info.pub_date,
-                    "category": info.category,
-                    "description": info.description[:300]
-                })
+            st.error("분류기호 추천에 실패했습니다. ISBN/키를 확인하거나, 다시 시도해 주세요.")
 
