@@ -12,8 +12,6 @@ import requests
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Tuple
 
-import streamlit as st
-
 import os
 import streamlit as st
 
@@ -609,4 +607,5 @@ if run_btn:
 
 else:
     st.info("ISBN-13을 입력한 후 ‘분류기호 추천’을 눌러주세요.")
+
 
