@@ -68,6 +68,53 @@ ALADIN_TTBKEY = (
 MODEL = DEFAULT_MODEL
 
 
+# 국립중앙도서관 API 키 (seoji SearchApi)
+NLK_API_KEY = (
+    _get_secret("api_keys", "nlk_key")
+    or os.environ.get("NLK_API_KEY", "")
+)
+
+def nlk_lookup_ea_add_code(isbn13: str, cert_key: str = NLK_API_KEY) -> Optional[str]:
+    """국립중앙도서관 서지 SearchApi로 EA_ADD_CODE 조회.
+    반환: 5자리 문자열(예: '00083') 또는 None
+    """
+    if not cert_key:
+        return None
+    try:
+        url = "https://www.nl.go.kr/seoji/SearchApi.do"
+        params = {
+            "cert_key": cert_key,
+            "result_style": "json",
+            "page_no": 1,
+            "page_size": 10,
+            "isbn": isbn13,
+        }
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        docs = data.get("docs") or data.get("items") or []
+        for d in docs:
+            ea = d.get("EA_ADD_CODE") or d.get("ea_add_code") or d.get("EA_ADD_CD")
+            if ea:
+                ea = str(ea).strip()
+                if len(ea) >= 5 and ea.isdigit():
+                    return ea[-5:]
+        return None
+    except Exception as e:
+        st.info(f"NLK SearchApi EA_ADD_CODE 조회 실패: {e}")
+        return None
+
+
+def _anchor_hundreds_from_ea(ea_add_code: str) -> Optional[str]:
+    """EA_ADD_CODE의 뒤 3자리를 이용해 류(첫 자리 수)를 계산해 '0~9' 문자열 반환"""
+    try:
+        tail3 = f"{int(ea_add_code[-3:]):03d}"
+        return tail3[0]  # ex) '813' -> '8'
+    except Exception:
+        return None
+
+
+
 
 @dataclass
 class BookInfo:
@@ -235,15 +282,17 @@ def aladin_lookup_by_web(isbn13: str) -> Optional[BookInfo]:
 
 
 # ───────── 3) 챗G에게 'KDC 숫자만' 요청 ─────────
-def ask_llm_for_kdc(book: BookInfo, api_key: str, model: str = DEFAULT_MODEL) -> Optional[str]:
+def ask_llm_for_kdc(book: BookInfo, api_key: str, model: str = DEFAULT_MODEL, anchor_hundreds: Optional[str] = None) -> Optional[str]:
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY가 필요합니다. 사이드바 또는 환경변수로 입력하세요.")
-
+    constrain = ""
+    if anchor_hundreds and anchor_hundreds.isdigit() and len(anchor_hundreds) == 1:
+        constrain = f" 반드시 분류기호의 '류(첫 자리 수)'는 {anchor_hundreds}로 시작해야 한다. (예: {anchor_hundreds}00대)"
     sys_prompt = (
         "너는 한국 십진분류(KDC) 전문가다. "
         "아래 도서 정보를 보고 KDC 분류기호를 '숫자만' 출력해라. "
         "형식 예시: 813.7 / 325.1 / 005 / 181 등. "
-        "설명, 접두/접미 텍스트, 기타 문자는 절대 출력하지 마라."
+        "설명, 접두/접미 텍스트, 기타 문자는 절대 출력하지 마라." + constrain
     )
     payload = {
         "title": book.title,
@@ -256,9 +305,9 @@ def ask_llm_for_kdc(book: BookInfo, api_key: str, model: str = DEFAULT_MODEL) ->
         "toc": book.toc,
     }
     user_prompt = (
-        "도서 정보(JSON):\n"
-        f"{json.dumps(payload, ensure_ascii=False, indent=2)}\n\n"
-        "KDC 숫자만 출력:"
+        "도서 정보:\n"
+        + json.dumps(payload, ensure_ascii=False, indent=2)
+        + "\n\nKDC 숫자만 출력:"
     )
 
     try:
@@ -274,29 +323,52 @@ def ask_llm_for_kdc(book: BookInfo, api_key: str, model: str = DEFAULT_MODEL) ->
                     {"role": "system", "content": sys_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
-                "temperature": 0.0,
-                "max_tokens": 8,
+                "temperature": 0.1,
+                "max_tokens": 32,
             },
             timeout=30,
         )
         resp.raise_for_status()
         data = resp.json()
-        text = (data["choices"][0]["message"]["content"] or "").strip()
-        return first_match_number(text)
+        msg = ((data.get("choices") or [{}])[0].get("message") or {}).get("content", "")
+        code = re.findall(r"[0-9]{1,3}(?:\.[0-9]+)?", msg)
+        code = code[0] if code else ""
+        code = code.strip()
+        if not code:
+            return None
+        if anchor_hundreds and code and code[0].isdigit() and code[0] != anchor_hundreds:
+            code = anchor_hundreds + code[1:]
+        return code
     except Exception as e:
         st.error(f"LLM 호출 오류: {e}")
         return None
 
 # ───────── 4) 파이프라인 ─────────
 def get_kdc_from_isbn(isbn13: str, ttbkey: Optional[str], openai_key: str, model: str) -> Optional[str]:
+    # 0) NLK EA_ADD_CODE로 '류' 앵커 확보
+    ea = nlk_lookup_ea_add_code(isbn13)
+    anchor_hundreds = None
+    if ea:
+        try:
+            # EA_ADD_CODE 뒤 3자리 → 분류기호 → 첫 자리만 앵커로 사용
+            tail3 = f"{int(ea[-3:]):03d}"
+            anchor_hundreds = tail3[0]
+            st.caption(f"🔒 EA_ADD_CODE={ea} → 앵커 류={anchor_hundreds}00대 (분류기호 {tail3} 기반)")
+        except Exception:
+            anchor_hundreds = None
+
+    # 1) 알라딘 정보
     info = aladin_lookup_by_api(isbn13, ttbkey) if ttbkey else None
     if not info:
         info = aladin_lookup_by_web(isbn13)
     if not info:
         st.warning("알라딘에서 도서 정보를 찾지 못했습니다.")
         return None
-    code = ask_llm_for_kdc(info, api_key=openai_key, model=model)
-    # 디버그용: 어떤 정보를 넘겼는지 보여주기(개인정보 없음)
+
+    # 2) LLM 판단 (앵커 류 고정)
+    code = ask_llm_for_kdc(info, api_key=openai_key, model=model, anchor_hundreds=anchor_hundreds)
+
+    # 3) 디버그: 어떤 정보를 넘겼는지 공개
     with st.expander("LLM 입력 정보(확인용)"):
         st.json({
             "title": info.title,
@@ -307,8 +379,10 @@ def get_kdc_from_isbn(isbn13: str, ttbkey: Optional[str], openai_key: str, model
             "category": info.category,
             "description": (info.description[:600] + "…") if info.description and len(info.description) > 600 else info.description,
             "toc": info.toc,
+            "ea_anchor_hundreds": anchor_hundreds
         })
     return code
+
 
 # ───────── UI ─────────
 st.title("📚 ISBN → KDC 추천 (알라딘 + 챗G)")
