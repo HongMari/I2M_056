@@ -1,777 +1,599 @@
-# new056.py (KDC3 내장 + EA 자리앵커 + 알라딘 + 요목표 강제 + 제너릭 라벨 필터 + 근거표)
-# - KDC3를 코드에 내장(000~999 전부 키 존재) → 일부 대표 3자리는 정확 라벨/키워드, 나머지는 자동확장으로 "류 일반/세부" 처리
-# - EA_ADD_CODE 뒤 3자리에서 0이 아닌 각 자리(백/십/일)를 앵커로 고정
-# - 알라딘에서 서지 확보 → 챗G는 '허용 3자리(요목표)' 목록 안에서만 선택하도록 강제
-# - "세부/일반" 같은 제너릭 라벨은 LLM 허용목록·미리보기·규칙 점수에서 최대한 배제(필요 시 최소 보충)
-# - LLM 출력 사후검증 + 규칙기반(요목표 키워드 매칭) 근거 표 제공
-# - 기존 UI 유지
-
+# -*- coding: utf-8 -*-
+"""
+KDC 분류기 (ISBN -> 알라딘 -> LLM 제로샷 + 얇은 규칙 하이브리드)
+- UI는 기존 Streamlit 구성 유지
+- 하단에 '분류 근거(Why)' 섹션 추가
+- 정확도/안정성 패치 포함:
+  top-K JSON, 깊이 스코어, 후보 재선택기, 상위류 재시도, critic pass, validator
+"""
 import os
 import re
 import json
-import html
-import urllib.parse
-from dataclasses import dataclass
-from typing import Optional, Dict, Any, List
-from bs4 import BeautifulSoup
-from pathlib import Path
-
+import time
 import requests
+from dataclasses import dataclass
+from typing import Optional, List, Dict, Tuple
+
 import streamlit as st
 
-# ───────────────────────────────────────────────────────────────
-st.set_page_config(page_title="ISBN → KDC 추천", page_icon="📚", layout="centered")
+# =========================
+# 환경설정
+# =========================
+ALADIN_KEY = os.getenv("ALADIN_TTB_KEY", "")
+OPENAI_KEY = os.getenv("OPENAI_API_KEY", "")
 
-# ───────── 상수/설정 ─────────
-DEFAULT_MODEL = "gpt-4o-mini"
-ALADIN_LOOKUP_URL = "https://www.aladin.co.kr/ttb/api/ItemLookUp.aspx"
-ALADIN_SEARCH_URL = "https://www.aladin.co.kr/search/wsearchresult.aspx"
 OPENAI_CHAT_COMPLETIONS = "https://api.openai.com/v1/chat/completions"
-NLK_SEARCH_API = "https://www.nl.go.kr/NL/search/openApi/search.do"
-NLK_SEOJI_API  = "https://www.nl.go.kr/seoji/SearchApi.do"
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # 필요 시 변경
 
-with st.expander("환경설정 디버그", expanded=True):
-    st.write("📁 앱 폴더:", Path(__file__).resolve().parent.as_posix())
-    st.write("🔎 secrets.toml 존재?:", (Path(__file__).resolve().parent / ".streamlit" / "secrets.toml").exists())
-    st.write("🔑 st.secrets 키들:", list(st.secrets.keys()))
-    st.write("api_keys 내용:", dict(st.secrets.get("api_keys", {})))
-    st.write("✅ openai_key 로드됨?:", bool(st.secrets.get("api_keys", {}).get("openai_key")))
-    st.write("✅ aladin_key 로드됨?:", bool(st.secrets.get("api_keys", {}).get("aladin_key")))
-    st.write("✅ nlk_key 로드됨?:", bool(st.secrets.get("api_keys", {}).get("nlk_key")))
-
-HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; KDCFetcher/1.0; +https://example.local)"}
-
-# ───────── secrets.toml 우선 사용, 없으면 환경변수 fallback ─────────
-def _get_secret(*path, default=""):
-    try:
-        v = st.secrets
-        for p in path:
-            v = v[p]
-        return v
-    except Exception:
-        return default
-
-OPENAI_API_KEY = (_get_secret("api_keys", "openai_key") or os.environ.get("OPENAI_API_KEY", ""))
-ALADIN_TTBKEY  = (_get_secret("api_keys", "aladin_key")  or os.environ.get("ALADIN_TTBKEY", ""))
-NLK_API_KEY    = (_get_secret("api_keys", "nlk_key")     or os.environ.get("NLK_API_KEY", ""))
-MODEL = DEFAULT_MODEL
-
+# =========================
+# 데이터 모델
+# =========================
 @dataclass
 class BookInfo:
+    isbn13: str = ""
     title: str = ""
     author: str = ""
-    pub_date: str = ""
     publisher: str = ""
-    isbn13: str = ""
-    category: str = ""
-    description: str = ""
-    toc: str = ""
-    extra: Dict[str, Any] = None
+    pub_date: str = ""
+    category: str = ""         # 알라딘 largeCategory 문자열(있으면)
+    toc: Optional[str] = ""    # 목차
+    description: Optional[str] = ""  # 책소개/설명
 
-# ───────── 유틸 ─────────
-def clean_text(s: Optional[str]) -> str:
-    if not s:
-        return ""
-    s = html.unescape(s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-def first_match_number(text: str) -> Optional[str]:
+# =========================
+# 유틸
+# =========================
+def trim(text: Optional[str], n: int = 1000) -> str:
     if not text:
-        return None
-    m = re.search(r"\b([0-9]{1,3}(?:\.[0-9]+)?)\b", text)
-    return m.group(1) if m else None
+        return ""
+    return text if len(text) <= n else text[:n] + "…"
 
-def strip_tags(html_text: str) -> str:
-    return re.sub(r"<[^>]+>", " ", html_text)
+def safe_get(d: dict, *keys, default=None):
+    cur = d
+    for k in keys:
+        if not isinstance(cur, dict) or k not in cur:
+            return default
+        cur = cur[k]
+    return cur
 
-def normalize_isbn13(isbn: str) -> str:
-    s = re.sub(r"[^0-9Xx]", "", isbn or "")
-    return s[-13:] if len(s) >= 13 else s
-
-# ───────── 요목표(3자리) — 내장(대표) + 자동확장으로 000~999 전체 구성 ─────────
-_KDC_HUNDREDS = {
-    "0": {"label": "총류",   "terms": ["총류","지식","학문","문헌정보","서지","백과사전","연속간행물","학회","단체","기관","신문","저널리즘","전집","총서","향토자료"]},
-    "1": {"label": "철학",   "terms": ["철학","사상","형이상학","인식론","논리학","심리학","윤리학","동양철학","서양철학"]},
-    "2": {"label": "종교",   "terms": ["종교","불교","기독교","천주교","이슬람","힌두교","도교","종교철학","경전","교리"]},
-    "3": {"label": "사회과학","terms": ["사회과학","경제","경영","정치","행정","법학","교육","통계","사회복지","군사"]},
-    "4": {"label": "자연과학","terms": ["자연과학","수학","물리학","화학","천문","지구과학","생명과학","식물학","동물학"]},
-    "5": {"label": "기술과학","terms": ["기술과학","의학","간호","공학","건축","기계","전기","전자","컴퓨터","화학공학","농업","식품","생활과학"]},
-    "6": {"label": "예술",   "terms": ["예술","미술","조각","공예","서예","회화","디자인","사진","음악","공연예술","영화","오락","스포츠"]},
-    "7": {"label": "언어",   "terms": ["언어","언어학","문법","사전","작문","번역","국어","영어","일본어","중국어","독일어","프랑스어","스페인어"]},
-    "8": {"label": "문학",   "terms": ["문학","문학이론","시","희곡","소설","수필","연설","일기","서간","기행","풍자","유머","르포","한국문학","영미문학"]},
-    "9": {"label": "역사",   "terms": ["역사","세계사","한국사","중국사","일본사","유럽사","아프리카사","아메리카사","오세아니아","지리","전기","지도"]},
-}
-
-_KDC_EXPLICIT_3 = {
-    # 000대
-    "000":{"label":"총류","terms":["총류","일반","지식"]},
-    "010":{"label":"도서학·서지학","terms":["도서학","서지학","서지"]},
-    "020":{"label":"문헌정보학","terms":["문헌정보학","도서관학","정보조직","분류","목록","메타데이터"]},
-    "030":{"label":"백과사전","terms":["백과사전","대백과"]},
-    "040":{"label":"일반 연속간행물","terms":["연속간행물","잡지","저널"]},
-    "050":{"label":"일반 학회·단체","terms":["학회","단체","협회"]},
-    "060":{"label":"일반 기관","terms":["기관","정부기관","연구소"]},
-    "070":{"label":"신문·언론·저널리즘","terms":["신문","언론","방송","뉴스","저널리즘"]},
-    "080":{"label":"전집·총서","terms":["전집","총서","선집"]},
-    "090":{"label":"향토자료","terms":["향토자료","지역자료"]},
-
-    # 100대
-    "100":{"label":"철학","terms":["철학","사상"]},
-    "110":{"label":"형이상학","terms":["형이상학","존재론"]},
-    "120":{"label":"인식론·인간학","terms":["인식론","인간학"]},
-    "130":{"label":"철학의 체계","terms":["체계"]},
-    "140":{"label":"경학","terms":["경학"]},
-    "150":{"label":"동양철학","terms":["동양철학","유교","불교철학"]},
-    "160":{"label":"서양철학","terms":["서양철학","실존주의","현상학"]},
-    "170":{"label":"논리학","terms":["논리학","추론"]},
-    "180":{"label":"심리학","terms":["심리학","인지","감정","행동"]},
-    "190":{"label":"윤리학, 도덕철학","terms":["윤리학","도덕"]},
-
-    # 200대
-    "200":{"label":"종교","terms":["종교","신앙"]},
-    "210":{"label":"비교종교","terms":["비교종교","종교사"]},
-    "220":{"label":"불교","terms":["불교","경전","선종","대승"]},
-    "230":{"label":"기독교","terms":["기독교","성경","신학"]},
-    "240":{"label":"도교","terms":["도교"]},
-    "250":{"label":"천도교","terms":["천도교"]},
-    "270":{"label":"힌두교, 브라만교","terms":["힌두교","브라만교"]},
-    "280":{"label":"이슬람교","terms":["이슬람","꾸란"]},
-    "290":{"label":"기타 종교","terms":["힌두교","도교","신흥종교"]},
-
-    # 300대
-    "300":{"label":"사회과학","terms":["사회과학"]},
-    "310":{"label":"통계자료","terms":["통계","데이터"]},
-    "320":{"label":"경제학","terms":["경제학","거시경제","미시경제"]},
-    "330":{"label":"사회학·사회문제","terms":["사회학","사회문제","복지"]},
-    "340":{"label":"정치학","terms":["정치","외교"]},
-    "350":{"label":"행정학","terms":["행정","공공관리"]},
-    "360":{"label":"법학","terms":["법학","헌법","형법","민법"]},
-    "370":{"label":"교육학","terms":["교육학","교육과정","평가"]},
-    "380":{"label":"풍습, 예절 민속학","terms":["풍습","예절","민속"]},    
-    "390":{"label":"국방·군사학","terms":["군사","안보"]},
-
-    # 400대
-    "400":{"label":"자연과학","terms":["자연과학"]},
-    "410":{"label":"수학","terms":["수학","대수","기하","해석","확률","통계"]},
-    "420":{"label":"물리학","terms":["물리","역학","전자기","양자","열"]},
-    "430":{"label":"화학","terms":["화학","유기화학","무기화학"]},
-    "440":{"label":"천문학","terms":["천문","우주","행성"]},
-    "450":{"label":"지학","terms":["지구과학","지질","기상","해양"]},
-    "460":{"label":"광물학","terms":["광물","원석"]},
-    "470":{"label":"생명과학","terms":["생명과학","생물","유전","분자생물"]},
-    "480":{"label":"식물학","terms":["식물","식물학"]},
-    "490":{"label":"동물학","terms":["동물","동물학"]},
-
-    # 500대
-    "500":{"label":"기술과학","terms":["기술과학"]},
-    "510":{"label":"의학","terms":["의학","내과","외과","약리","공중보건"]},
-    "520":{"label":"농업","terms":["농업","임업","원예","수의"]},
-    "530":{"label":"공학","terms":["공학","공학일반"]},
-    "550":{"label":"기계공학","terms":["기계","제조","메카트로닉스"]},
-    "560":{"label":"전기공학","terms":["전기","전자","전력","모터"]},
-    "570":{"label":"화학공학","terms":["화학공학","공정","재료"]},
-    "580":{"label":"제조업","terms":["제조","생산","품질"]},
-    "590":{"label":"생활과학","terms":["가정","생활과학","식품","영양"]},
-
-    # 600대
-    "600":{"label":"예술","terms":["예술"]},
-    "620":{"label":"조각","terms":["조각","도자기","조형"]},
-    "630":{"label":"공예","terms":["공예"]},
-    "640":{"label":"서예","terms":["서예","캘리그래피"]},
-    "650":{"label":"회화","terms":["회화","드로잉","수채","유화","디자인"]},
-    "660":{"label":"사진예술","terms":["사진","영상","촬영","후보정"]},
-    "670":{"label":"음악","terms":["음악","악기","작곡","이론"]},
-    "680":{"label":"공연예술","terms":["공연","무용","연극","뮤지컬"]},
-    "690":{"label":"오락·스포츠","terms":["오락","스포츠","게임"]},
-
-    # 700대
-    "700":{"label":"언어","terms":["언어","언어학"]},
-    "710":{"label":"한국어","terms":["국어","한국어","문법","맞춤법","말하기","쓰기"]},
-    "720":{"label":"중국어","terms":["중국어","Chinese","HSK"]},
-    "730":{"label":"일본어","terms":["일본어","Japanese","JLPT"]},
-    "740":{"label":"영어","terms":["영어","English","문법","회화","독해","작문","토익","토플"]},
-    "750":{"label":"독일어","terms":["독일어","German"]},
-    "760":{"label":"프랑스어","terms":["프랑스어","French"]},
-    "770":{"label":"스페인어","terms":["스페인어","Spanish"]},
-    "780":{"label":"이탈리아어","terms":["이탈리아어","Italia"]},
-    "790":{"label":"기타 제어","terms":["러시아어","아랍어"]},
-
-    # 800대
-    "800":{"label":"문학","terms":["문학"]},
-    "810":{"label":"한국문학","terms":["한국","한국문학"]},
-    "820":{"label":"중국문학","terms":["중국","중국문학"]},
-    "830":{"label":"일본문학","terms":["일본","일본문학"]},   
-    "840":{"label":"영미문학","terms":["영미","영미문학"]},
-    "850":{"label":"독일문학","terms":["독문학"]},
-    "860":{"label":"프랑스문학","terms":["불문학"]},
-    "870":{"label":"스페인·포르투갈문학","terms":["서반아문학","스페인","포르투갈"]},
-    "880":{"label":"이탈리아문학","terms":["이탈리아문학","이탈리아"]},
-    "890":{"label":"기타 제문학","terms":["러시아문학","러시아","아랍문학","아랍"]},
-
-    # 900대
-    "900":{"label":"역사","terms":["역사"]},
-    "910":{"label":"아시아","terms":["아시아사","아시아"]},
-    "920":{"label":"유럽사","terms":["유럽사","유럽"]},
-    "930":{"label":"아프리카","terms":["아프리카사","아프리카"]},
-    "940":{"label":"북아메리카","terms":["북아메리카사","미국사","캐나다사","북아메리카"]},
-    "950":{"label":"남아메리카사","terms":["남아메리카사"]},
-    "960":{"label":"오세아니아사","terms":["오세아니아사","북극","남극"]},
-    "980":{"label":"지리","terms":["지리","여행","지도"]},
-    "990":{"label":"전기","terms":["전기","전기문"]},
-}
-
-def _auto_expand_kdc3(explicit_map: dict, hundreds_map: dict) -> dict:
-    """명시된 3자리 외의 전 영역(000~999)을 '류 일반/세부'로 자동 보충해 전체 사전을 완성."""
-    full = dict(explicit_map)
-    for h in "0123456789":
-        base = hundreds_map[h]
-        for t in "0123456789":
-            for u in "0123456789":
-                code = f"{h}{t}{u}"
-                if code in full:
-                    continue
-                label = f"{base['label']} 일반"
-                terms = list(base["terms"])
-                if t != "0" or u != "0":
-                    label = f"{base['label']} 세부"
-                full[code] = {"label": label, "terms": terms}
-    return full
-
-# 실행 시 전체(000~999) 3자리 사전 완성
-KDC3: Dict[str, Dict[str, Any]] = _auto_expand_kdc3(_KDC_EXPLICIT_3, _KDC_HUNDREDS)
-
-# === NEW: 제너릭 라벨 여부 판단 ===
-def _is_generic_label(label: str) -> bool:
-    if not label:
-        return True
-    lbl = str(label)
-    return ("세부" in lbl) or ("일반" in lbl)
-
-# === NEW: LLM용 허용목록(의미 있는 라벨 위주) 구성 ===
-def build_allowed_for_llm(allowed_all: Dict[str, Dict[str,Any]],
-                          anchors: Dict[str, Optional[str]],
-                          min_keep: int = 12) -> Dict[str, Dict[str,Any]]:
+# =========================
+# 알라딘 API 조회
+# =========================
+def aladin_lookup_by_api(isbn13: str) -> Optional[BookInfo]:
     """
-    1) 의미 있는 라벨(세부/일반 아닌 것)만 우선 채택
-    2) 너무 적으면(앵커로 과도히 좁혀진 경우) 제너릭 일부를 보충
+    알라딘 TTB API로 도서 정보 조회
+    참고: https://www.aladin.co.kr/ttb/api/ItemLookUp.aspx
     """
-    meaningful = {k:v for k,v in allowed_all.items() if not _is_generic_label(v.get("label",""))}
-    if len(meaningful) >= min_keep:
-        return meaningful
-
-    generic = {k:v for k,v in allowed_all.items() if k not in meaningful}
-    # 우선순위: (십/일 자리가 0이 아닌 코드) > 나머지
-    def _generic_rank(code: str) -> tuple:
-        return ((code[1] != "0") + (code[2] != "0"), code)  # 세분도, 코드정렬
-    generic_sorted = dict(sorted(generic.items(), key=lambda kv: _generic_rank(kv[0]), reverse=True))
-
-    out = dict(meaningful)
-    for k, v in generic_sorted.items():
-        out[k] = v
-        if len(out) >= min_keep:
-            break
-    return out if out else allowed_all
-
-def outline_slice_by_anchors(anc: Dict[str, Optional[str]]) -> Dict[str, Dict[str, Any]]:
-    """자리앵커(백/십/일) 제약으로 KDC3 허용 집합 필터."""
-    pool = KDC3
-    h, t, u = anc.get("hundreds"), anc.get("tens"), anc.get("units")
-    if h:
-        pool = {k:v for k,v in pool.items() if len(k)==3 and k[0]==h}
-    if t:
-        pool = {k:v for k,v in pool.items() if len(k)==3 and k[1]==t}
-    if u:
-        pool = {k:v for k,v in pool.items() if len(k)==3 and k[2]==u}
-    return pool
-
-def allowed_outline_hint(allowed: Dict[str, Dict[str,Any]], limit=40) -> str:
-    """LLM 프롬프트용 허용목록 힌트: '813=한국소설; 814=한국수필; ...' (코드 정렬기준 상위 N개)."""
-    items = sorted(allowed.items(), key=lambda kv: kv[0])[:limit]
-    return "; ".join([f"{code}={spec.get('label','')}" for code, spec in items])
-
-# ───────── EA_ADD_CODE 조회 ─────────
-def get_ea_add_code_last3(isbn13: str, key: str) -> Optional[str]:
-    if not key:
-        st.info("NLK_API_KEY가 없어 EA_ADD_CODE 조회를 건너뜁니다.")
-        return None
-    # 1) 서지(ISBN) API (권장)
-    try:
-        p1 = {"cert_key": key, "result_style": "json", "page_no": 1, "page_size": 5, "isbn": isbn13}
-        r1 = requests.get(NLK_SEOJI_API, params=p1, headers=HEADERS, timeout=10)
-        r1.raise_for_status()
-        d1 = r1.json()
-        docs = d1.get("docs") if isinstance(d1, dict) else None
-        if isinstance(docs, list) and docs:
-            ea = docs[0].get("EA_ADD_CODE") or docs[0].get("ea_add_code")
-            if ea:
-                m = re.search(r"(\d{3})$", str(ea))
-                if m:
-                    last3 = m.group(1)
-                    st.success(f"(서지API) EA_ADD_CODE: {ea} → 뒤 3자리={last3}")
-                    return last3
-    except Exception as e:
-        st.info(f"서지API 실패 → 일반검색 백업: {e}")
-    # 2) 일반검색 백업
-    try:
-        p2 = {"key": key, "srchTarget": "total", "kwd": isbn13, "pageNum": 1, "pageSize": 1, "apiType": "json"}
-        r2 = requests.get(NLK_SEARCH_API, params=p2, headers=HEADERS, timeout=10)
-        r2.raise_for_status()
-        d2 = r2.json()
-        result = d2.get("result") if isinstance(d2, dict) else None
-        if isinstance(result, list):
-            result = result[0] if result else {}
-        recs = None
-        if isinstance(result, dict):
-            recs = result.get("recordList") or result.get("recordlist") or result.get("records") or result.get("record")
-        if isinstance(recs, dict):
-            recs = [recs]
-        if isinstance(recs, list) and recs:
-            rec0 = recs[0]
-            if isinstance(rec0, list) and rec0:
-                rec0 = rec0[0]
-            if isinstance(rec0, dict):
-                ea = rec0.get("EA_ADD_CODE") or rec0.get("ea_add_code")
-                if ea:
-                    m = re.search(r"(\d{3})$", str(ea))
-                    if m:
-                        last3 = m.group(1)
-                        st.success(f"(일반검색) EA_ADD_CODE: {ea} → 뒤 3자리={last3}")
-                        return last3
-        st.warning("NLK SearchApi EA_ADD_CODE 조회 실패: 응답 구조 미일치")
-        return None
-    except Exception as e:
-        st.warning(f"NLK SearchApi EA_ADD_CODE 조회 실패: {e}")
-        return None
-
-# ───────── 자리별 앵커 유틸 ─────────
-def build_anchor_from_last3(last3: Optional[str]) -> Dict[str, Optional[str]]:
-    """
-    last3 예: '813' → 백=8, 십=1, 일=3 (0보다 큰 자리만 고정) / '800' → 백=8만 고정
-    """
-    anchors = {"hundreds": None, "tens": None, "units": None, "pattern": "x-x-x"}
-    if not (last3 and len(last3) == 3 and last3.isdigit()):
-        return anchors
-    h, t, u = last3[0], last3[1], last3[2]
-    anchors["hundreds"] = h if int(h) > 0 else None
-    anchors["tens"]     = t if int(t) > 0 else None
-    anchors["units"]    = u if int(u) > 0 else None
-    anchors["pattern"]  = f"{anchors['hundreds'] or 'x'}-{anchors['tens'] or 'x'}-{anchors['units'] or 'x'}"
-    return anchors
-
-def enforce_anchor_digits(code: Optional[str], anc: Dict[str, Optional[str]]) -> Optional[str]:
-    if not code:
-        return code
-    m = re.match(r"^(\d{1,3})(.*)$", code)
-    if not m:
-        return code
-    head, tail = m.group(1), m.group(2)
-    head = (head + "000")[:3]
-    h, t, u = list(head)
-    if anc.get("hundreds"): h = anc["hundreds"]
-    if anc.get("tens"):     t = anc["tens"]
-    if anc.get("units"):    u = anc["units"]
-    return f"{h}{t}{u}" + tail
-
-# ───────── 알라딘 API/웹 ─────────
-def aladin_lookup_by_api(isbn13: str, ttbkey: str) -> Optional[BookInfo]:
-    if not ttbkey:
+    if not ALADIN_KEY:
         return None
     params = {
-        "ttbkey": ttbkey, "itemIdType": "ISBN13", "ItemId": isbn13,
-        "output": "js", "Version": "20131101",
-        "OptResult": "authors,categoryName,fulldescription,toc,packaging,ratings"
+        "ttbkey": ALADIN_KEY,
+        "itemIdType": "ISBN13",
+        "ItemId": isbn13,
+        "output": "js",
+        "Version": "20131101",
+        "OptResult": "toc,story,categoryName",
+        "Cover": "Big"
     }
     try:
-        r = requests.get(ALADIN_LOOKUP_URL, params=params, headers=HEADERS, timeout=15)
-        r.raise_for_status()
-        data = r.json()
+        resp = requests.get("https://www.aladin.co.kr/ttb/api/ItemLookUp.aspx", params=params, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
         items = data.get("item", [])
         if not items:
-            st.info("알라딘 API(ItemLookUp)에서 결과 없음 → 스크레이핑 백업 시도")
             return None
         it = items[0]
+
+        title = it.get("title", "")
+        author = it.get("author", "")
+        pub = it.get("publisher", "")
+        date = it.get("pubDate", "")
+        desc = it.get("description", "") or it.get("story", "")
+        toc = it.get("toc", "")
+        # categoryName: "국내도서>문학>소설>한국소설"
+        category = it.get("categoryName", "") or it.get("categoryNameEng", "")
+
         return BookInfo(
-            title=clean_text(it.get("title")),
-            author=clean_text(it.get("author")),
-            pub_date=clean_text(it.get("pubDate")),
-            publisher=clean_text(it.get("publisher")),
-            isbn13=clean_text(it.get("isbn13")) or isbn13,
-            category=clean_text(it.get("categoryName")),
-            description=clean_text(it.get("fulldescription")) or clean_text(it.get("description")),
-            toc=clean_text(it.get("toc")),
-            extra=it,
-        )
-    except Exception as e:
-        st.info(f"알라딘 API 호출 예외 → {e} / 스크레이핑 백업 시도")
-        return None
-
-def aladin_lookup_by_web(isbn13: str) -> Optional[BookInfo]:
-    try:
-        params = {"SearchTarget": "Book", "SearchWord": f"isbn:{isbn13}"}
-        sr = requests.get(ALADIN_SEARCH_URL, params=params, headers=HEADERS, timeout=15)
-        sr.raise_for_status()
-        soup = BeautifulSoup(sr.text, "html.parser")
-
-        link_tag = soup.select_one("a.bo3")
-        item_url = None
-        if link_tag and link_tag.get("href"):
-            item_url = urllib.parse.urljoin("https://www.aladin.co.kr", link_tag["href"])
-        if not item_url:
-            m = re.search(r'href=[\'\"](/shop/wproduct\.aspx\?ItemId=\d+[^\'\"]*)[\'\"]', sr.text, re.I)
-            if m:
-                item_url = urllib.parse.urljoin("https://www.aladin.co.kr", html.unescape(m.group(1)))
-        if not item_url:
-            first_card = soup.select_one(".ss_book_box, .ss_book_list")
-            if first_card:
-                a = first_card.find("a", href=True)
-                if a:
-                    item_url = urllib.parse.urljoin("https://www.aladin.co.kr", a["href"])
-
-        if not item_url:
-            st.warning("알라딘 검색 페이지에서 상품 링크를 찾지 못했습니다.")
-            with st.expander("디버그: 검색 페이지 HTML 일부"):
-                st.code(sr.text[:2000])
-            return None
-
-        pr = requests.get(item_url, headers=HEADERS, timeout=15)
-        pr.raise_for_status()
-        psoup = BeautifulSoup(pr.text, "html.parser")
-
-        og_title = psoup.select_one('meta[property="og:title"]')
-        og_desc  = psoup.select_one('meta[property="og:description"]')
-        title = clean_text(og_title["content"]) if og_title and og_title.has_attr("content") else ""
-        desc  = clean_text(og_desc["content"]) if og_desc and og_desc.has_attr("content") else ""
-
-        body_text = clean_text(psoup.get_text(" "))[:4000]
-        description = desc or body_text
-
-        author = ""
-        publisher = ""
-        pub_date = ""
-        cat_text = ""
-
-        info_box = psoup.select_one("#Ere_prod_allwrap, #Ere_prod_mconts_wrap, #Ere_prod_titlewrap")
-        if info_box:
-            text = clean_text(info_box.get_text(" "))
-            m_author = re.search(r"(저자|지은이)\s*:\s*([^\|·/]+)", text)
-            m_publisher = re.search(r"(출판사)\s*:\s*([^\|·/]+)", text)
-            m_pubdate = re.search(r"(출간일|출판일)\s*:\s*([0-9]{4}\.[0-9]{1,2}\.[0-9]{1,2})", text)
-            if m_author:   author   = clean_text(m_author.group(2))
-            if m_publisher: publisher = clean_text(m_publisher.group(2))
-            if m_pubdate:  pub_date = clean_text(m_pubdate.group(2))
-
-        crumbs = psoup.select(".location, .path, .breadcrumb")
-        if crumbs:
-            cat_text = clean_text(" > ".join(c.get_text(" ") for c in crumbs))
-
-        with st.expander("디버그: 스크레이핑 진입 URL / 파싱 결과"):
-            st.write({"item_url": item_url, "title": title})
-        
-        return BookInfo(
-            title=title,
-            description=description,
             isbn13=isbn13,
+            title=title,
             author=author,
-            publisher=publisher,
-            pub_date=pub_date,
-            category=cat_text
+            publisher=pub,
+            pub_date=date,
+            category=category,
+            toc=toc,
+            description=desc
         )
-    except Exception as e:
-        st.error(f"웹 스크레이핑 예외: {e}")
+    except Exception:
         return None
 
-# ───────── 요목표 기반 규칙 점수(보조 근거) ─────────
-def score_outline_candidates(info: BookInfo, allowed: Dict[str, Dict[str,Any]]) -> List[Dict[str, Any]]:
-    """
-    허용된 3자리 집합 안에서 텍스트 매칭 점수화 → 근거표 보조.
-    리턴: [{"code":"813","label":"한국소설","hits":[...],"score":..,"conf":..}, ...]
-    """
-    text = f"{(info.title or '').lower()} {(info.category or '').lower()} {(info.description or '')[:800].lower()}"
-    scored = []
-    for code3, spec in allowed.items():
-        terms = spec.get("terms", [])
-        hits = sorted({w for w in terms if w and w.lower() in text})
-        if not hits:
-            continue
-        t = (info.title or "").lower()
-        c = (info.category or "").lower()
-        d = (info.description or "").lower()
-        s = 0.0
-        for h in hits:
-            s += (2.0 if h.lower() in t else 0.0) + (1.5 if h.lower() in c else 0.0) + (1.0 if h.lower() in d else 0.0)
-        # === 제너릭 라벨 패널티 ===
-        if _is_generic_label(spec.get("label","")):
-            s *= 0.6  # 40% 패널티
-        scored.append({"code": code3, "label": spec.get("label",""), "hits": hits, "score": s})
-    if scored:
-        mx = max(x["score"] for x in scored) or 1.0
-        for x in scored:
-            x["conf"] = round(x["score"]/mx, 4)
-    scored.sort(key=lambda x: (x.get("conf",0), x.get("score",0)), reverse=True)
-    return scored[:12]
+# =========================
+# 이지 라우터(고신뢰 소형 규칙)
+# =========================
+EASY_RULES = [
+    # 문학 장르
+    (r"(장편|단편|소설|웹소설|라이트노벨)", "813.7"),
+    (r"(시집|시선|서정시|시문학)", "811.6"),
+    (r"(에세이|수필|산문)", "814.6"),
+    (r"(동화|그림책|아동문학|창작동화)", "813.8"),
+    (r"(희곡|연극 대본|드라마 대본)", "815.7"),
+    # 생활/취미
+    (r"(요리|레시피|쿠킹|베이킹|빵|디저트)", "594.5"),
+    (r"(반려동물|애완동물|강아지|고양이)", "595.4"),
+    (r"(인테리어|홈스타일링|리모델링)", "597.3"),
+    (r"(원예|가드닝|텃밭|정원)", "524.5"),
+    # 여행/지리(간단 국가/지역 키워드만)
+    (r"(한국|대한민국|서울|부산|제주)\s*(여행|가이드|투어|코스)", "981"),
+    (r"(일본|도쿄|오사카|교토)\s*(여행|가이드|투어|코스)", "982"),
+    (r"(유럽|프랑스|파리|이탈리아|로마|스페인|바르셀로나)\s*(여행|가이드|투어|코스)", "986"),
+    # 학습/수험
+    (r"(수능|기출|모의고사|문제집|해설|자격|CBT|NCS|토익|토플|한자[ ]?능력)", "373"),
+    (r"(초등|중학|고등)[^가-힣A-Za-z0-9]?(국어|수학|영어|사회|과학|역사)", "372"),
+    # 컴퓨터/프로그래밍
+    (r"(프로그래밍|코딩|파이썬|자바스크립트|알고리즘|자료구조|데이터 분석|머신러닝|딥러닝)", "005"),
+    # 경영/마케팅/창업
+    (r"(마케팅|브랜딩|스타트업|창업|그로스해킹)", "325.1"),
+]
 
-# ───────── LLM 호출 (요목표 허용목록 강제) ─────────
-def ask_llm_for_kdc_with_allowed(book: BookInfo, api_key: str, model: str,
-                                 anchors: Dict[str, Optional[str]],
-                                 allowed: Dict[str, Dict[str,Any]]) -> Optional[str]:
+def easy_router(title: str, desc: str) -> Optional[str]:
+    text = f"{title or ''} {desc or ''}"
+    for pat, code in EASY_RULES:
+        if re.search(pat, text, flags=re.IGNORECASE):
+            return code
+    return None
+
+# =========================
+# 깊이 스코어(세목 승격 판단)
+# =========================
+SPECIFIC_TERMS = [
+    # 예시: 특정 이론/도구/매체/개념
+    "행동경제학", "실험경제학", "계량경제", "통계학", "인지심리", "정신분석", "DSM-5",
+    "딥러닝", "머신러닝", "뉴럴네트워크", "파이썬", "텐서플로", "파이토치",
+    "질적연구", "양적연구", "혼합방법", "메타분석", "케이스스터디",
+]
+
+METHOD_OR_AUDIENCE = [
+    "실험", "통계", "임상", "사례연구", "케이스스터디", "초등", "중등", "고등",
+    "수험", "자격", "교재", "실무", "현장가이드", "매뉴얼", "핸드북", "프로토콜", "워크북"
+]
+
+GEO_OR_LANGUAGE = [
+    "한국", "대한민국", "서울", "부산", "제주", "영미", "영어", "일본", "중국", "독일", "프랑스",
+    "일본어", "중국어", "독일어", "프랑스어", "스페인어", "러시아어", "라틴어"
+]
+
+TEACHING_OR_EXAM = [
+    "문제집", "기출", "모의고사", "자격", "수능", "토익", "토플", "CBT", "NCS", "교재", "워크북"
+]
+
+SERIES_SIGNAL = [
+    "총서", "○○총서", "학회총서", "시리즈", "리더스", "핸드북 시리즈", "가이드 시리즈"
+]
+
+def has_any(text: str, keywords: List[str]) -> bool:
+    return any(kw for kw in keywords if kw.lower() in (text or "").lower())
+
+def has_specific_terms(book: BookInfo) -> bool:
+    t = f"{book.title} {book.toc} {book.description}"
+    return has_any(t, SPECIFIC_TERMS)
+
+def has_method_or_audience(book: BookInfo) -> bool:
+    t = f"{book.title} {book.toc} {book.description}"
+    return has_any(t, METHOD_OR_AUDIENCE)
+
+def has_geo_or_language(book: BookInfo) -> bool:
+    t = f"{book.title} {book.toc} {book.description}"
+    return has_any(t, GEO_OR_LANGUAGE)
+
+def is_teaching_or_exam_type(book: BookInfo) -> bool:
+    t = f"{book.title} {book.toc} {book.description}"
+    return has_any(t, TEACHING_OR_EXAM)
+
+def has_series_signal(book: BookInfo) -> bool:
+    t = f"{book.title} {book.toc} {book.description}"
+    return has_any(t, SERIES_SIGNAL)
+
+def shelf_density_high(book: BookInfo) -> bool:
+    # 실제로는 분야별 소장량 지표를 연동하여 판단.
+    # 초기값은 False로 두고, 운영 로그 기반으로 점진 보정.
+    return False
+
+def compute_depth_score(book: BookInfo) -> float:
+    score = 0.0
+    score += 0.35 if has_specific_terms(book) else 0.0
+    score += 0.20 if has_method_or_audience(book) else 0.0
+    score += 0.15 if has_geo_or_language(book) else 0.0
+    score += 0.15 if is_teaching_or_exam_type(book) else 0.0
+    score += 0.10 if has_series_signal(book) else 0.0
+    score += 0.15 if shelf_density_high(book) else 0.0
+    return min(score, 1.0)
+
+def require_decimal(depth_score: float) -> bool:
+    # 경험값. 운영 로그 보며 튜닝.
+    return depth_score >= 0.5
+
+# =========================
+# LLM 호출 (top-K JSON)
+# =========================
+def ask_llm_for_kdc_candidates(book: BookInfo, api_key: str, model: str, k: int = 3) -> Dict:
     if not api_key:
-        raise RuntimeError("OPENAI_API_KEY가 필요합니다.")
-    rules = []
-    if anchors.get("hundreds"): rules.append(f"백의 자리는 {anchors['hundreds']}")
-    if anchors.get("tens"):     rules.append(f"십의 자리는 {anchors['tens']}")
-    if anchors.get("units"):    rules.append(f"일의 자리는 {anchors['units']}")
-    anchor_txt = ""
-    if rules:
-        mask = anchors.get("pattern","x-x-x").replace("-","")
-        anchor_txt = (" 자리 제약: " + ", ".join(rules) +
-                      f" → 기본 3자리는 '{mask}' 패턴을 따라야 한다. ")
+        return {"candidates": []}
 
-    allowed_hint = allowed_outline_hint(allowed, limit=60) or "(없음)"
     sys_prompt = (
-        "너는 한국 십진분류(KDC) 전문가다. 아래 서지정보를 바탕으로 KDC 분류기호를 '숫자만' 출력하라. "
-        "최대 한 줄, 다른 텍스트 금지. "
-        + anchor_txt +
-        " 반드시 기본 3자리는 아래 '허용 목록' 중 하나여야 한다(목록 밖은 무효). "
-        f"허용 목록(코드=라벨): {allowed_hint} "
-        "예) 813.7 / 325.1 / 005 / 181 과 같은 형태로 숫자만."
+        "너는 한국십진분류(KDC) 전문가다. 반드시 KDC 기준을 사용하라.\n"
+        "출력은 최소 3자리(세부 주류)를 제시하라. 000·100·...·900 같은 상위류만의 답변은 "
+        "총람/사전/연감/개론일 때만 허용한다.\n"
+        "다음 신호(특정 이론·도구, 방법·대상, 지리·언어, 교재·시험, 시리즈/임프린트)가 2개 이상이면 "
+        "소수점 세목을 제시하라.\n"
+        "반드시 다음 JSON 스키마로만 응답하라(그 외 텍스트 금지):\n"
+        "{\"candidates\":[{\"kdc\":\"string\",\"conf\":0.0,\"why\":\"string\"}]}\n"
     )
-    payload = {
-        "title": book.title, "author": book.author, "publisher": book.publisher, "pub_date": book.pub_date,
-        "isbn13": book.isbn13, "category": book.category,
-        "description": (book.description or "")[:1200], "toc": (book.toc or "")[:800]
+
+    payload_primary = {
+        "title": book.title, "author": book.author, "publisher": book.publisher,
+        "pub_date": book.pub_date, "isbn13": book.isbn13, "category": book.category
     }
-    user_prompt = "서지 정보(JSON):\n" + json.dumps(payload, ensure_ascii=False, indent=2) + "\n\nKDC 숫자만:"
-    try:
-        resp = requests.post(
-            OPENAI_CHAT_COMPLETIONS,
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json={"model": model,
-                  "messages": [{"role":"system","content":sys_prompt},
-                               {"role":"user","content":user_prompt}],
-                  "temperature":0.0, "max_tokens":16},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        text = (resp.json()["choices"][0]["message"]["content"] or "").strip()
-        return first_match_number(text)
-    except Exception as e:
-        st.error(f"LLM 호출 오류: {e}")
-        return None
+    payload_textual = {
+        "title": book.title, "toc": trim(book.toc, 800), "description": trim(book.description, 800)
+    }
 
-# ───────── LLM 후보(근거표시용) ─────────
-def ask_llm_for_kdc_ranking(book: BookInfo, api_key: str, model: str,
-                            anchors: Dict[str, Optional[str]],
-                            allowed: Dict[str, Dict[str,Any]]) -> Optional[List[Dict[str, Any]]]:
+    user_prompt = (
+        f"입력 A(전거): {json.dumps(payload_primary, ensure_ascii=False)}\n\n"
+        f"입력 B(내용): {json.dumps(payload_textual, ensure_ascii=False)}\n\n"
+        f"두 입력을 함께 고려하여 KDC top-{k} 후보를 JSON으로만 출력하라."
+    )
+
+    try:
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        body = {
+            "model": model,
+            "messages": [{"role": "system", "content": sys_prompt},
+                         {"role": "user", "content": user_prompt}],
+            "temperature": 0.0,
+            "max_tokens": 220
+        }
+
+        # 지원 모델이면 JSON 모드 지정(옵션)
+        body["response_format"] = {"type": "json_object"}
+
+        resp = requests.post(OPENAI_CHAT_COMPLETIONS, headers=headers, json=body, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        txt = safe_get(data, "choices", 0, "message", "content", default="{}")
+        parsed = json.loads(txt)
+        if "candidates" not in parsed:
+            return {"candidates": []}
+        # sanity
+        cands = parsed.get("candidates", [])
+        cleaned = []
+        for c in cands:
+            kdc = str(c.get("kdc", "")).strip()
+            conf = float(c.get("conf", 0.5))
+            why = str(c.get("why", "")).strip()
+            if not kdc:
+                continue
+            cleaned.append({"kdc": kdc, "conf": conf, "why": why})
+        return {"candidates": cleaned[:k]}
+    except Exception:
+        return {"candidates": []}
+
+# =========================
+# 상위류 판정 / 개론/총람 예외
+# =========================
+TOP_CLASSES = {"000","100","200","300","400","500","600","700","800","900"}
+
+GENERAL_WORK_HINTS = [
+    "총람", "총설", "총론", "개론", "입문", "핸드북", "연감", "백과", "Encyclopedia", "개설", "전사", "통사"
+]
+
+def is_top_class(code: Optional[str]) -> bool:
+    return code in TOP_CLASSES
+
+def is_true_general_work(book: BookInfo) -> bool:
+    t = f"{book.title} {book.description}"
+    return has_any(t, GENERAL_WORK_HINTS)
+
+# =========================
+# 후보 재선택기(+로그)
+# =========================
+def pick_final_kdc_with_log(book: BookInfo, candidates: List[Dict], depth_score: float) -> Tuple[Optional[str], Dict]:
+    logs = {"scores": []}
+    need_decimal = require_decimal(depth_score)
+
+    def score(c):
+        k = str(c.get("kdc", "")).strip()
+        s = float(c.get("conf", 0.5))
+        raw = s
+
+        # 세목 가산 / 상위류 페널티 / 세목 요구시 페널티
+        if re.fullmatch(r"[0-9]{3}", k):
+            s -= 0.08
+        if re.fullmatch(r"[0-9]{3}\.[0-9]+", k):
+            s += 0.06
+        if need_decimal and re.fullmatch(r"[0-9]{3}", k):
+            s -= 0.15
+
+        # 문학에서 800/810만 나오면 페널티
+        if "소설" in (book.title or "") and k in {"800", "810"}:
+            s -= 0.25
+
+        # 보조 신호 가중
+        s += 0.02 * sum([
+            has_geo_or_language(book),
+            has_method_or_audience(book),
+            is_teaching_or_exam_type(book)
+        ])
+
+        logs["scores"].append({"kdc": k, "conf": round(raw, 3), "score": round(s, 3)})
+        return s
+
+    ordered = sorted(candidates, key=score, reverse=True)
+    chosen = ordered[0]["kdc"] if ordered else None
+    logs["require_decimal"] = need_decimal
+    logs["chosen"] = chosen
+    return chosen, logs
+
+# =========================
+# critic pass / 검증기
+# =========================
+def critic_check(book: BookInfo, final_code: Optional[str], candidates: List[Dict]) -> Tuple[bool, str]:
+    """
+    간단 critic: 최종 코드가 상위류로만 나왔는데 총람/개론도 아니면 경고.
+    (추가로 LLM에 '요목과 모순 여부'를 재질의하는 2차 호출을 넣을 수도 있음.)
+    """
+    if not final_code:
+        return False, "코드 없음"
+    if is_top_class(final_code) and not is_true_general_work(book):
+        return False, "상위류만 제시되었으나 총람/개론으로 보이지 않음"
+    return True, "OK"
+
+def validate_code(kdc_code: Optional[str]) -> Dict:
+    ok_syntax = bool(re.fullmatch(r"^[0-9]{3}(\.[0-9]{1,2})?$", kdc_code or ""))
+    top_class = is_top_class(kdc_code)
+    return {
+        "syntax_ok": ok_syntax,
+        "is_top_class": top_class,
+        "message": None if ok_syntax else "형식 오류: 3자리 또는 3자리+소수점(1~2) 필요"
+    }
+
+# =========================
+# 재시도(세목 강제 프롬프트)
+# =========================
+def retry_with_stronger_prompt_for_decimal(book: BookInfo, api_key: str, model: str) -> Optional[str]:
+    """
+    상위류만 반환된 경우, '세목(소수점) 필수'를 강제한 짧은 재질의.
+    """
     if not api_key:
         return None
-    rules = []
-    if anchors.get("hundreds"): rules.append(f"백={anchors['hundreds']}")
-    if anchors.get("tens"):     rules.append(f"십={anchors['tens']}")
-    if anchors.get("units"):    rules.append(f"일={anchors['units']}")
-    allowed_hint = allowed_outline_hint(allowed, limit=60) or "(없음)"
+
     sys_prompt = (
-        "너는 한국 십진분류(KDC) 전문가다. 상위 후보를 JSON으로만 반환하라. "
-        '스키마: {"candidates":[{"code":str,"confidence":number,"evidence_terms":[str...],'
-        '"_view":str,"factors":{"title":number,"category":number,"author":number,"publisher":number,"desc":number,"toc":number}}]} '
-        "반드시 기본 3자리는 다음 허용 목록 중 하나여야 한다(목록 밖 금지). "
-        f"허용 목록: {allowed_hint}. 자리 제약: {', '.join(rules) if rules else '없음'}."
-        " 추가 텍스트/코드펜스 금지. 후보 3~5개."
+        "너는 한국십진분류(KDC) 전문가다. 반드시 소수점 세목을 제시하라. "
+        "총람/사전/연감/개론이 아닌 이상 상위류(000·100…·900) 단독 답변은 금지한다. "
+        "출력은 KDC 세목 숫자만."
     )
-    payload = {"title": book.title,"author": book.author,"publisher": book.publisher,"pub_date": book.pub_date,
-               "isbn13": book.isbn13,"category": book.category,
-               "description": (book.description or "")[:1200], "toc": (book.toc or "")[:800]}
-    user_prompt = "서지 정보(JSON):\n" + json.dumps(payload, ensure_ascii=False, indent=2) + "\n\nJSON만 반환:"
+    user_prompt = (
+        f"제목: {book.title}\n"
+        f"저자/출판: {book.author}/{book.publisher}({book.pub_date})\n"
+        f"ISBN: {book.isbn13}\n"
+        f"분류에 도움되는 내용(요약): {trim(book.toc or book.description, 800)}\n"
+        "이 자료의 KDC 세목(소수점 포함)을 숫자만 출력."
+    )
     try:
-        resp = requests.post(
-            OPENAI_CHAT_COMPLETIONS,
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json={"model": model, "messages":[{"role":"system","content":sys_prompt},
-                                              {"role":"user","content":user_prompt}],
-                  "temperature":0.0, "max_tokens":520},
-            timeout=30,
-        )
-        text = (resp.json()["choices"][0]["message"]["content"] or "").strip()
-        raw = text[text.find("{"): text.rfind("}")+1] if "{" in text and "}" in text else text
-        raw = raw.replace("“", '"').replace("”", '"').replace("’", "'").replace("‘", "'")
-        raw = re.sub(r",\s*([}\]])", r"\1", raw)
-        parsed = json.loads(raw)
-        cands = parsed.get("candidates") if isinstance(parsed, dict) else None
-        if isinstance(cands, list) and cands:
-            for c in cands:
-                if "confidence" in c:
-                    try: c["confidence"] = float(c["confidence"])
-                    except: pass
-                if isinstance(c.get("factors"), dict):
-                    for k,v in list(c["factors"].items()):
-                        try: c["factors"][k] = float(v)
-                        except: pass
-            try: cands = sorted(cands, key=lambda x: float(x.get("confidence",0)), reverse=True)
-            except: pass
-            return cands
-        return None
-    except Exception as e:
-        st.info(f"근거/순위 JSON 생성 실패: {e}")
+        headers = {"Authorization": f"Bearer {OPENAI_KEY}", "Content-Type": "application/json"}
+        body = {
+            "model": model,
+            "messages": [{"role": "system", "content": sys_prompt},
+                         {"role": "user", "content": user_prompt}],
+            "temperature": 0.0,
+            "max_tokens": 10
+        }
+        resp = requests.post(OPENAI_CHAT_COMPLETIONS, headers=headers, json=body, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+        txt = safe_get(data, "choices", 0, "message", "content", default="").strip()
+        # 숫자만 필터
+        m = re.search(r"[0-9]{3}\.[0-9]{1,2}|[0-9]{3}", txt)
+        return m.group(0) if m else None
+    except Exception:
         return None
 
-# ───────── 파이프라인 ─────────
-def get_kdc_from_isbn(isbn13: str, ttbkey: Optional[str], openai_key: str, model: str) -> Dict[str, Any]:
-    # 0) EA → last3 & 자리앵커
-    last3 = get_ea_add_code_last3(isbn13, NLK_API_KEY)
-    anchors = build_anchor_from_last3(last3)
+# =========================
+# Evidence 컨테이너
+# =========================
+def build_evidence() -> Dict:
+    return {
+        "input": {},
+        "easy_rule": None,
+        "depth_score": None,
+        "llm_candidates": [],
+        "post_selection": {},
+        "critic": {},
+        "validator": {},
+        "final": {}
+    }
 
-    # 1) 알라딘
-    info = aladin_lookup_by_api(isbn13, ttbkey) if ttbkey else None
-    if not info:
-        info = aladin_lookup_by_web(isbn13)
-    if not info:
-        st.warning("알라딘에서 도서 정보를 찾지 못했습니다.")
-        return {"code": None, "anchors": anchors, "ea_add_last3": last3,
-                "ranking": None, "signals": None, "llm_raw": None,
-                "allowed_size": 0, "allowed_preview": "", "outline_rank": None}
+# =========================
+# 메인 분류 함수 (final + evidence 반환)
+# =========================
+def classify_kdc(book_info: BookInfo, openai_key: str, model: str) -> Tuple[Optional[str], Dict]:
+    ev = build_evidence()
+    ev["input"] = {
+        "title": book_info.title,
+        "author": book_info.author,
+        "publisher": book_info.publisher,
+        "pub_date": book_info.pub_date,
+        "isbn": book_info.isbn13,
+        "category": book_info.category,
+        "toc": trim(book_info.toc, 800),
+        "description": trim(book_info.description, 800),
+    }
 
-    # 2) 허용 가능한 3자리(요목표) 집합 구성 (자리앵커로 필터)
-    allowed_all = outline_slice_by_anchors(anchors)
-    allowed_for_llm = build_allowed_for_llm(allowed_all, anchors, min_keep=12)
+    # 1) 이지 라우터
+    easy = easy_router(book_info.title, (book_info.description or book_info.toc or ""))
+    ev["easy_rule"] = {"matched": bool(easy), "code": easy}
+    if easy:
+        final = easy
+        ev["final"] = {"source": "easy_router", "code": final, "decimal_required": False, "note": "고신뢰 규칙 일치"}
+        ev["validator"] = validate_code(final)
+        return final, ev
 
-    allowed_set_all = set(allowed_all.keys())
-    allowed_preview = allowed_outline_hint(allowed_for_llm, limit=30)
+    # 2) LLM top-K 후보
+    cand_json = ask_llm_for_kdc_candidates(book_info, openai_key, model, k=3)
+    candidates = cand_json.get("candidates", [])
+    ev["llm_candidates"] = candidates
 
-    # 3) 규칙 기반(요목표) 후보 — 근거용은 '의미 있는 라벨'을 우선 활용
-    outline_rank = score_outline_candidates(info, allowed_for_llm)
+    # 3) 깊이 스코어
+    g = compute_depth_score(book_info)
+    ev["depth_score"] = g
 
-    # 4) LLM: 허용 3자리 강제(정제된 목록 사용)
-    llm_raw = ask_llm_for_kdc_with_allowed(info, api_key=openai_key, model=model,
-                                           anchors=anchors, allowed=allowed_for_llm)
-    code = enforce_anchor_digits(llm_raw, anchors)
+    # 4) 후보 재선택기
+    final, pick_log = pick_final_kdc_with_log(book_info, candidates, g)
+    ev["post_selection"] = pick_log
 
-    # 5) 사후검증: 허용목록(전체 allowed_all 기준) 위반 시 보정
-    head3 = None
-    if code:
-        m = re.match(r"^(\d{3})", code)
-        if m:
-            head3 = m.group(1)
-    if code and head3 not in allowed_set_all:
-        st.warning(f"LLM 결과({code})의 기본 3자리 {head3}가 허용 목록에 없음 → 규칙 기반 최고 후보로 보정")
-        if outline_rank:
-            best = outline_rank[0]["code"]
-            tail = ""
-            m2 = re.match(r"^\d{3}(\.[0-9]+)?$", code)
-            if m2 and m2.group(1):
-                tail = m2.group(1)
-            code = best + (tail or "")
-            head3 = best
-        else:
-            fallback = sorted(list(allowed_set_all))[0] if allowed_set_all else None
-            code = fallback or code
+    # 5) 상위류만이면 재시도(세목 강제), 총람/개론 예외 허용
+    if final and is_top_class(final) and not is_true_general_work(book_info):
+        repl = retry_with_stronger_prompt_for_decimal(book_info, openai_key, model)
+        ev["post_selection"]["retry_decimal"] = bool(repl)
+        if repl:
+            final = repl
 
-    # 6) LLM 후보(근거표) 생성
-    ranking = ask_llm_for_kdc_ranking(info, api_key=openai_key, model=model,
-                                      anchors=anchors, allowed=allowed_for_llm)
+    # 6) critic
+    ok, note = critic_check(book_info, final, candidates)
+    ev["critic"] = {"ok": ok, "note": note}
 
-    # 7) 디버그 입력
-    with st.expander("LLM 입력 정보(확인용)"):
-        st.json({
-            "title": info.title, "author": info.author, "publisher": info.publisher, "pub_date": info.pub_date,
-            "isbn13": info.isbn13, "category": info.category,
-            "description": (info.description[:600] + "…") if info.description and len(info.description) > 600 else info.description,
-            "toc": info.toc, "ea_add_last3": last3, "anchors": anchors,
-            "allowed_size": len(allowed_for_llm), "allowed_preview": allowed_preview,
-            "llm_raw": llm_raw, "final_code": code
-        })
+    # 7) validator
+    ev["validator"] = validate_code(final)
 
-    signals = {"title": info.title[:120], "category": info.category[:120], "author": info.author[:80], "publisher": info.publisher[:80]}
-    return {"code": code, "anchors": anchors, "ea_add_last3": last3, "ranking": ranking,
-            "signals": signals, "llm_raw": llm_raw,
-            "allowed_size": len(allowed_for_llm), "allowed_preview": allowed_preview,
-            "outline_rank": outline_rank}
+    # 8) 최종 사유
+    ev["final"] = {
+        "code": final,
+        "source": "llm+selector",
+        "decimal_required": require_decimal(g),
+        "note": "세목 승격 기준 적용" if require_decimal(g) else "3자리 최소 보장"
+    }
+    return final, ev
 
-# ───────── UI ─────────
-st.title("📚 ISBN → KDC 추천 (알라딘 → 요목표(3자리) 강제 + 자리앵커 + 챗G)")
-st.caption("알라딘 서지 + EA 자리앵커를 바탕으로, 챗G가 **요목표(3자리) 허용 목록 안에서만** 분류를 정합니다.")
+# =========================
+# Streamlit UI
+# =========================
+st.set_page_config(page_title="KDC 분류기 자동 추천", page_icon="📚", layout="wide")
 
-isbn = st.text_input("ISBN-13 입력", placeholder="예: 9791193904565").strip()
-go = st.button("분류기호 추천")
+st.title("📚 KDC 분류기 자동 추천")
+st.caption("ISBN → 알라딘 → LLM 제로샷 + 얇은 규칙 하이브리드 (근거 표시 포함)")
 
-if go:
-    if not isbn:
-        st.warning("ISBN을 입력하세요.")
+with st.sidebar:
+    st.markdown("### 설정")
+    st.write("환경변수로 API 키를 읽습니다.")
+    st.text(f"ALADIN_TTB_KEY: {'OK' if ALADIN_KEY else '미설정'}")
+    st.text(f"OPENAI_API_KEY: {'OK' if OPENAI_KEY else '미설정'}")
+    model = st.text_input("OpenAI 모델", value=OPENAI_MODEL)
+    st.markdown("---")
+    st.markdown("**Tip**: 설명/목차가 충분할수록 정확도가 높아집니다.")
+
+# 입력 영역 (UI는 유지)
+isbn_input = st.text_input("ISBN-13 입력", value="", placeholder="예: 9788934939603")
+run_btn = st.button("분류기호 추천")
+
+book_info: Optional[BookInfo] = None
+final_kdc: Optional[str] = None
+evidence: Dict = {}
+
+if run_btn:
+    if not isbn_input.strip():
+        st.warning("ISBN-13을 입력하세요.")
+        st.stop()
+
+    with st.spinner("도서 정보 조회 중…"):
+        book_info = aladin_lookup_by_api(isbn_input.strip())
+
+    if not book_info:
+        st.error("알라딘에서 도서 정보를 찾지 못했습니다.")
+        st.stop()
+
+    # 도서 정보 표시
+    st.markdown("### 도서 정보")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.write(f"**제목**: {book_info.title}")
+        st.write(f"**저자**: {book_info.author}")
+        st.write(f"**출판사/발행일**: {book_info.publisher} / {book_info.pub_date}")
+        st.write(f"**ISBN-13**: {book_info.isbn13}")
+        st.write(f"**카테고리**: {book_info.category or '-'}")
+    with c2:
+        st.write("**설명(요약)**")
+        st.write(trim(book_info.description, 500) or "-")
+        st.write("**목차(요약)**")
+        st.write(trim(book_info.toc, 500) or "-")
+
+    # 분류 실행
+    with st.spinner("분류기호 산출 중…"):
+        final_kdc, evidence = classify_kdc(book_info, OPENAI_KEY, model)
+
+    # 결과 표시 (UI 유지)
+    st.markdown("### 📌 추천 분류기호 (KDC)")
+    if final_kdc:
+        st.metric(label="최종 KDC", value=final_kdc)
     else:
-        norm = normalize_isbn13(isbn)
-        if not norm or len(norm) != 13:
-            st.info("ISBN-13 형식으로 입력하는 것을 권장합니다.")
-        with st.spinner("EA 자리앵커 확인 → 알라딘 정보 수집 → 요목표 허용목록 구성 → 챗G 판단…"):
-            result = get_kdc_from_isbn(isbn13=norm or isbn, ttbkey=ALADIN_TTBKEY, openai_key=OPENAI_API_KEY, model=MODEL)
+        st.error("분류기호를 산출하지 못했습니다. 근거 섹션을 확인하세요.")
 
-        st.subheader("결과")
-        last3 = result.get("ea_add_last3")
-        anchors = result.get("anchors") or {}
-        pattern = anchors.get("pattern", "x-x-x")
-        if last3:
-            st.markdown(f"- **EA_ADD_CODE 뒤 3자리**: `{last3}` → **자리앵커 패턴**: `{pattern}`")
-        else:
-            st.markdown("- **EA_ADD_CODE**: 조회 실패(다음 단계로 진행)")
-        code = result.get("code")
-        if code:
-            st.markdown(f"### ✅ 추천 KDC: **`{code}`**")
-            st.caption("※ 챗G는 요목표(3자리) 허용 목록 안에서만 선택하도록 강제되며, 자리앵커로 보정됩니다.")
-        else:
-            st.error("분류기호 추천에 실패했습니다. ISBN/키를 확인하거나, 다시 시도해 주세요.")
+    # --- 분류 근거 섹션 (하단 추가) ---
+    st.markdown("---")
+    st.subheader("🔎 분류 근거(Why)")
 
-        # ───────── 근거/순위·조합 + 세부 요소 ─────────
-        st.markdown("---")
-        st.markdown("#### 🔎 추천 근거 (요목표 허용목록 + 규칙 적중 + LLM 후보)")
-        st.markdown(f"- **허용 3자리 개수**: {result.get('allowed_size',0)}")
-        st.markdown(f"- **허용 3자리 미리보기**: {result.get('allowed_preview') or '-'}")
+    with st.expander("상세 근거 펼치기", expanded=False):
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("**입력 요약**")
+            st.write(f"- 제목: {evidence.get('input',{}).get('title','')}")
+            st.write(f"- 출판사/발행: {evidence.get('input',{}).get('publisher','')} / {evidence.get('input',{}).get('pub_date','')}")
+            st.write(f"- ISBN: {evidence.get('input',{}).get('isbn','')}")
+            st.write(f"- 카테고리: {evidence.get('input',{}).get('category','-')}")
+        with col2:
+            st.markdown("**판단 개요**")
+            ez = evidence.get("easy_rule", {}) or {}
+            st.write(f"- 이지 규칙 일치: {'예' if ez.get('matched') else '아니오'}"
+                     + (f" → `{ez.get('code')}`" if ez.get('matched') and ez.get('code') else ""))
+            g = evidence.get("depth_score", 0.0) or 0.0
+            final_meta = evidence.get("final", {}) or {}
+            st.write(f"- 깊이점수(g): {g:.2f} "
+                     + ("→ 세목 승격" if final_meta.get('decimal_required') else "→ 3자리 최소 보장"))
+            st.write(f"- 최종 결정: `{final_meta.get('code','-')}` ({final_meta.get('source','-')})")
 
-        sig = result.get("signals") or {}
-        ranking = result.get("ranking") or []
-        llm_raw = result.get("llm_raw")
-        outline_rank = result.get("outline_rank") or []
-
-        st.markdown(f"- **EA 자리앵커**: 백={anchors.get('hundreds') or 'x'}, 십={anchors.get('tens') or 'x'}, 일={anchors.get('units') or 'x'} (패턴 `{pattern}`)")
-        st.markdown(f"- **LLM 원출력**: `{llm_raw or '-'}` → 앵커/허용목록 검증 후 → `{code or '-'}`")
-        st.markdown(f"- **사용 메타데이터**: 제목='{sig.get('title','')}', 카테고리='{sig.get('category','')}', 저자='{sig.get('author','')}', 출판사='{sig.get('publisher','')}'")
-
-        import pandas as _pd
-
-        # 1) 요목표 규칙 후보(보조 근거)
-        if outline_rank:
-            rows_rb = []
-            for i, c in enumerate(outline_rank, start=1):
-                rows_rb.append({
-                    "순위(RB)": i,
-                    "KDC(3자리)": c.get("code"),
-                    "라벨": c.get("label",""),
-                    "키워드 적중": ", ".join(c.get("hits",[])[:10]),
-                    "규칙 신뢰도": f"{c.get('conf',0)*100:.1f}%"
-                })
-            st.markdown("**요목표(3자리) 기반 규칙 후보**")
-            st.dataframe(_pd.DataFrame(rows_rb), use_container_width=True)
-        else:
-            st.caption("요목표 기반 규칙 후보: 적중 없음")
-
-        # 2) LLM 후보(허용목록 강제 하에서의 판단)
-        if ranking:
+        st.markdown("**LLM 후보와 선택 근거**")
+        if evidence.get("llm_candidates"):
+            st.write("LLM이 제시한 후보와 신뢰도:")
             rows = []
-            for i, c in enumerate(ranking, start=1):
-                code_i = c.get("code") or ""
-                conf = c.get("confidence")
-                try: conf_pct = f"{float(conf)*100:.1f}%"
-                except: conf_pct = ""
-                factors = c.get("factors", {}) if isinstance(c.get("factors"), dict) else {}
+            for c in evidence["llm_candidates"]:
                 rows.append({
-                    "순위(LLM)": i,
-                    "KDC 후보": code_i,
-                    "신뢰도": conf_pct,
-                    "근거 키워드": ", ".join((c.get("evidence_terms") or [])[:8]),
-                    "가중치(title/category/author/publisher/desc/toc)": ", ".join(
-                        [f"{k}:{factors.get(k):.2f}" for k in ["title","category","author","publisher","desc","toc"]
-                         if isinstance(factors.get(k), (int, float))]
-                    ) or "-",
+                    "KDC": c.get("kdc"),
+                    "신뢰도": round(float(c.get("conf", 0.0)), 2),
+                    "근거 요약": trim(c.get("why", ""), 120)
                 })
-            st.markdown("**LLM 상위 후보(요목표 허용목록 기반)**")
-            st.dataframe(_pd.DataFrame(rows), use_container_width=True)
-        else:
-            st.caption("LLM 후보: 생성 안 됨 (JSON 실패/정보 부족)")
+            st.table(rows)
 
+        if (evidence.get("post_selection") or {}).get("scores"):
+            st.write("후보 재선택 가중치 점수(높을수록 우선):")
+            st.table(evidence["post_selection"]["scores"])
+
+        st.markdown("**검증 단계**")
+        val = evidence.get("validator", {}) or {}
+        st.write(f"- 형식 검사: {'OK' if val.get('syntax_ok') else val.get('message','형식 오류')}")
+        st.write(f"- 상위류 여부: {'예' if val.get('is_top_class') else '아니오'}")
+        if evidence.get("critic"):
+            st.write(f"- Critic 검토: {'통과' if evidence['critic'].get('ok') else '재검토'}"
+                     + (f" / 메모: {evidence['critic'].get('note')}" if evidence['critic'].get('note') else ""))
+
+        with st.expander("원본 Evidence JSON 보기 (전문)"):
+            st.json(evidence)
+
+    # (선택) 불확실 배지
+    try:
+        avg_conf = 0.0
+        cands = evidence.get("llm_candidates") or []
+        if cands:
+            avg_conf = sum(float(c.get("conf", 0.0)) for c in cands) / len(cands)
+        if avg_conf < 0.6:
+            st.info("⚠️ 신뢰도가 낮습니다. 검토가 필요할 수 있습니다.")
+    except Exception:
+        pass
+
+else:
+    st.info("ISBN-13을 입력한 후 ‘분류기호 추천’을 눌러주세요.")
