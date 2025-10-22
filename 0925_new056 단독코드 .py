@@ -1,5 +1,4 @@
-# new056.py (EA_ADD_CODE → 자리별 앵커 고정 + 근거/순위 파싱 보강)
-# 기존 UI 유지: ① EA_ADD_CODE 뒤 3자리 중 0이 아닌 자리 고정 → ② 알라딘 + LLM → ③ 근거(순위·조합 + 세부 요소)
+# new056.py (EA_ADD_CODE → 자리별 앵커 + 요목표 활용 + 근거/순위 보강)
 
 import os
 import re
@@ -7,7 +6,7 @@ import json
 import html
 import urllib.parse
 from dataclasses import dataclass
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 from bs4 import BeautifulSoup
 from pathlib import Path
 
@@ -88,6 +87,59 @@ def normalize_isbn13(isbn: str) -> str:
     s = re.sub(r"[^0-9Xx]", "", isbn or "")
     return s[-13:] if len(s) >= 13 else s
 
+# ───────── KDC 요목표(요약 키워드) ─────────
+# - LLM 및 규칙기반 매칭에 사용할 간단 요약. (필요하면 더 촘촘히 확장 가능)
+KDC_OUTLINE: Dict[str, Dict[str, List[str]]] = {
+    "0": {"name": "총류", "terms": [
+        "지식", "학문 일반", "도서학", "서지학", "문헌정보학", "백과사전", "연속간행물", "학회", "단체", "기관", "신문", "저널리즘", "전집", "총서", "향토자료"
+    ]},
+    "1": {"name": "철학", "terms": [
+        "형이상학","인식론","논리학","심리학","윤리학","동양철학","서양철학","철학사상"
+    ]},
+    "2": {"name": "종교", "terms": [
+        "불교","기독교","도교","천도교","힌두교","이슬람교","종교철학","경전","교리","예배","종파"
+    ]},
+    "3": {"name": "사회과학", "terms": [
+        "경제학","경영","사회학","정치학","행정학","법학","교육학","통계","사회복지","여성문제","군사학"
+    ]},
+    "4": {"name": "자연과학", "terms": [
+        "수학","물리학","화학","천문학","지학","광물학","생명과학","식물학","동물학"
+    ]},
+    "5": {"name": "기술과학", "terms": [
+        "의학","농업","공학","건축","기계공학","전기공학","전자공학","화학공학","제조업","생활과학","식품공학"
+    ]},
+    "6": {"name": "예술", "terms": [
+        "미술","조각","공예","서예","회화","디자인","사진","음악","공연예술","영화","오락","스포츠"
+    ]},
+    "7": {"name": "언어", "terms": [
+        "언어학","국어","영어","중국어","일본어","독일어","프랑스어","스페인어","이탈리아어","사전","문법","작문","회화","방언"
+    ]},
+    "8": {"name": "문학", "terms": [
+        "문학이론","시","희곡","소설","수필","연설","일기","서간","기행","풍자","유머","르포르타주","한국문학","영미문학","프랑스문학","독일문학","스페인문학","이탈리아문학"
+    ]},
+    "9": {"name": "역사", "terms": [
+        "세계사","한국사","중국사","일본사","유럽사","아프리카사","북아메리카사","남아메리카사","오세아니아","지리","전기","지도","아시아","유럽"
+    ]},
+}
+
+def outline_keywords_for_anchor(anchors: Dict[str, Optional[str]]) -> Tuple[str, List[str]]:
+    """
+    anchors에 백의 자리가 있으면 해당 류의 요약만, 없으면 0~9 전부를 간단 문자열로 반환.
+    또한 매칭용 키워드 리스트를 함께 반환.
+    """
+    if anchors.get("hundreds") in KDC_OUTLINE:
+        h = anchors["hundreds"]
+        block = f"{h}00 {KDC_OUTLINE[h]['name']}: " + ", ".join(KDC_OUTLINE[h]["terms"])
+        return block, KDC_OUTLINE[h]["terms"]
+    # 전체 요약
+    parts = []
+    terms = []
+    for d in "0123456789":
+        if d in KDC_OUTLINE:
+            parts.append(f"{d}00 {KDC_OUTLINE[d]['name']}")
+            terms += KDC_OUTLINE[d]["terms"]
+    return " / ".join(parts), list(set(terms))
+
 # ───────── EA_ADD_CODE 조회 ─────────
 def get_ea_add_code_last3(isbn13: str, key: str) -> Optional[str]:
     """1차: 서지 API → docs[0].EA_ADD_CODE, 2차: 일반검색 API → recordList[0].EA_ADD_CODE"""
@@ -146,8 +198,7 @@ def get_ea_add_code_last3(isbn13: str, key: str) -> Optional[str]:
 # ───────── 자리별 앵커 유틸 ─────────
 def build_anchor_from_last3(last3: Optional[str]) -> Dict[str, Optional[str]]:
     """
-    last3 예: '813' → 백=8, 십=1, 일=3 (0보다 큰 자리만 고정)
-    '800' → 백=8만 고정, 'x-x-x' 패턴 표기
+    last3 예: '813' → 백=8, 십=1, 일=3 (0보다 큰 자리만 고정) / '800' → 백=8만 고정
     """
     anchors = {"hundreds": None, "tens": None, "units": None, "pattern": "x-x-x"}
     if not (last3 and len(last3) == 3 and last3.isdigit()):
@@ -159,19 +210,22 @@ def build_anchor_from_last3(last3: Optional[str]) -> Dict[str, Optional[str]]:
     anchors["pattern"]  = f"{anchors['hundreds'] or 'x'}-{anchors['tens'] or 'x'}-{anchors['units'] or 'x'}"
     return anchors
 
-def anchor_clause_for_prompt(anc: Dict[str, Optional[str]]) -> str:
+def anchor_clause_for_prompt(anc: Dict[str, Optional[str]], outline_snippet: str) -> str:
     rules = []
     if anc.get("hundreds"): rules.append(f"백의 자리는 {anc['hundreds']}")
     if anc.get("tens"):     rules.append(f"십의 자리는 {anc['tens']}")
     if anc.get("units"):    rules.append(f"일의 자리는 {anc['units']}")
-    if not rules:
-        return ""
-    mask = anc.get("pattern", "x-x-x").replace("-", "")
-    examples = [mask.replace("x", d) for d in ["0","1","2"]]
-    return (
-        " 반드시 다음 자릿수 제약을 지켜라: " + ", ".join(rules) +
-        f". 즉, 분류번호는 '{mask}' 패턴으로 시작해야 한다(예: {', '.join(e + '.7' for e in examples)}). "
-    )
+    base = ""
+    if rules:
+        mask = anc.get("pattern", "x-x-x").replace("-", "")
+        examples = [mask.replace("x", d) for d in ["0","1","2"]]
+        base = (
+            " 반드시 다음 자릿수 제약을 지켜라: " + ", ".join(rules) +
+            f". 즉, 분류번호는 '{mask}' 패턴으로 시작해야 한다(예: {', '.join(e + '.7' for e in examples)}). "
+        )
+    # 요목표 스니펫(참고용)
+    base += " 아래의 KDC 요목표 범위를 벗어나지 말고, 가장 근접한 분류를 선택하라. 참고 요목표: " + outline_snippet
+    return base
 
 def enforce_anchor_digits(code: Optional[str], anc: Dict[str, Optional[str]]) -> Optional[str]:
     if not code:
@@ -309,7 +363,6 @@ def ask_llm_for_kdc(book: BookInfo, api_key: str, model: str, anchor_clause: str
 
 # ───────── JSON 파싱 보강 유틸 ─────────
 def _extract_json_object(text: str) -> Optional[str]:
-    """응답에서 최상위 JSON 객체만 안전하게 추출(코드펜스/프리텍스트 섞임 대비)."""
     if not text:
         return None
     m = re.search(r"```json\s*(\{[\s\S]*?\})\s*```", text, re.I)
@@ -342,7 +395,6 @@ def _extract_json_object(text: str) -> Optional[str]:
     return None
 
 def _sanitize_json(s: str) -> str:
-    """자잘한 문법 오류 보정: 스마트쿼트/트레일링 콤마/컨트롤문자 제거 등."""
     s = s.replace("“", '"').replace("”", '"').replace("’", "'").replace("‘", "'")
     s = re.sub(r"```.*?```", "", s, flags=re.S)
     s = re.sub(r",\s*([}\]])", r"\1", s)
@@ -408,10 +460,8 @@ def ask_llm_for_kdc_ranking(book: BookInfo, api_key: str, model: str, anchor_cla
             except Exception:
                 pass
             return cands
-
         st.info("근거/순위 JSON: candidates가 비어 있거나 형식이 일치하지 않습니다.")
         return None
-
     except json.JSONDecodeError as je:
         st.warning(f"근거/순위 JSON 생성 실패(JSONDecode): {je}")
         return None
@@ -419,25 +469,25 @@ def ask_llm_for_kdc_ranking(book: BookInfo, api_key: str, model: str, anchor_cla
         st.info(f"근거/순위 JSON 생성 실패: {e}")
         return None
 
-# ───────── 간단 규칙 적중 ─────────
-def extract_rule_hits(info: BookInfo) -> Dict[str, List[str]]:
-    text = f"{info.title} {info.category} {info.description[:400]}" if info else ""
-    buckets = {
-        "문학": ["소설","문학","시집","희곡","에세이","수필"],
-        "사회": ["사회","정치","경제","경영","법","행정"],
-        "자연": ["과학","수학","물리","화학","생물","지구과학"],
-        "기술": ["의학","간호","공학","컴퓨터","프로그래밍","코딩"],
-        "예술": ["예술","미술","디자인","음악","건축","사진"],
-        "언어": ["언어","문법","국어","영어","일본어","중국어"],
-        "역사": ["역사","한국사","세계사","고고학"],
-        "철학": ["철학","사상","인문"],
-    }
-    hits = {}
-    for k, words in buckets.items():
-        matched = [w for w in words if w in text]
-        if matched:
-            hits[k] = matched
-    return hits
+# ───────── 규칙 적중(요목표 기반) ─────────
+def outline_rule_hits(info: BookInfo, anchors: Dict[str, Optional[str]]) -> Dict[str, Any]:
+    """
+    요목표 키워드 매칭 결과:
+      - matched: {류: [적중어...]}
+      - dominant: 가장 적중이 많은 류(백의 자리) 또는 None
+    """
+    text = f"{info.title} {info.category} {info.description[:600]}".lower() if info else ""
+    matched: Dict[str, List[str]] = {}
+    for d, spec in KDC_OUTLINE.items():
+        terms = spec["terms"]
+        hits = sorted({t for t in terms if t.lower() in text})
+        if hits:
+            matched[d] = hits
+    # 최다 적중 류
+    dominant = None
+    if matched:
+        dominant = max(matched.items(), key=lambda kv: len(kv[1]))[0]
+    return {"matched": matched, "dominant": dominant}
 
 # ───────── 파이프라인 ─────────
 def get_kdc_from_isbn(isbn13: str, ttbkey: Optional[str], openai_key: str, model: str) -> Dict[str, Any]:
@@ -445,41 +495,49 @@ def get_kdc_from_isbn(isbn13: str, ttbkey: Optional[str], openai_key: str, model
     last3 = get_ea_add_code_last3(isbn13, NLK_API_KEY)
     anchors = build_anchor_from_last3(last3)
 
+    # 요목표 스니펫 생성 (프롬프트용)
+    outline_snippet, _ = outline_keywords_for_anchor(anchors)
+
     # 1) 알라딘
     info = aladin_lookup_by_api(isbn13, ttbkey) if ttbkey else None
     if not info:
         info = aladin_lookup_by_web(isbn13)
     if not info:
         st.warning("알라딘에서 도서 정보를 찾지 못했습니다.")
-        return {"code": None, "anchors": anchors, "ea_add_last3": last3, "ranking": None, "signals": None, "llm_raw": None}
+        return {"code": None, "anchors": anchors, "ea_add_last3": last3, "ranking": None,
+                "signals": None, "llm_raw": None, "outline_hits": None}
 
-    # 2) LLM (자리별 앵커 제약 반영)
-    anchor_clause = anchor_clause_for_prompt(anchors)
+    # 2) 요목표 규칙 적중
+    o_hits = outline_rule_hits(info, anchors)
+
+    # 3) LLM (자리별 앵커 + 요목표 제약 반영)
+    anchor_clause = anchor_clause_for_prompt(anchors, outline_snippet)
     llm_raw = ask_llm_for_kdc(info, api_key=openai_key, model=model, anchor_clause=anchor_clause)
     ranking  = ask_llm_for_kdc_ranking(info, api_key=openai_key, model=model, anchor_clause=anchor_clause)
 
-    # 3) 자리별 앵커 강제 보정
+    # 4) 자리별 앵커 강제 보정
     code = enforce_anchor_digits(llm_raw, anchors)
 
-    # 4) 디버그 입력
+    # 5) 디버그 입력
     with st.expander("LLM 입력 정보(확인용)"):
         st.json({
             "title": info.title, "author": info.author, "publisher": info.publisher, "pub_date": info.pub_date,
             "isbn13": info.isbn13, "category": info.category,
             "description": (info.description[:600] + "…") if info.description and len(info.description) > 600 else info.description,
             "toc": info.toc, "ea_add_last3": last3, "anchors": anchors,
-            "anchor_clause": anchor_clause, "llm_raw": llm_raw,
+            "outline_snippet": outline_snippet, "anchor_clause": anchor_clause, "llm_raw": llm_raw,
         })
 
-    # 5) 신호 요약 + 규칙 적중 내역
+    # 6) 신호 요약
     signals = {"title": info.title[:120], "category": info.category[:120], "author": info.author[:80], "publisher": info.publisher[:80]}
-    rule_hits = extract_rule_hits(info)
 
-    return {"code": code, "anchors": anchors, "ea_add_last3": last3, "ranking": ranking, "signals": signals, "llm_raw": llm_raw, "rule_hits": rule_hits}
+    return {"code": code, "anchors": anchors, "ea_add_last3": last3,
+            "ranking": ranking, "signals": signals, "llm_raw": llm_raw,
+            "outline_hits": o_hits}
 
 # ───────── UI ─────────
-st.title("📚 ISBN → KDC 추천 (EA 자리앵커 + 알라딘 + 챗G)")
-st.caption("① EA_ADD_CODE 뒤 3자리에서 0이 아닌 자리 숫자를 고정(예: 813→8·1·3 고정, 800→8만 고정) → ② 알라딘 수집 → ③ 챗G로 KDC 도출")
+st.title("📚 ISBN → KDC 추천 (EA 자리앵커 + 요목표 + 알라딘 + 챗G)")
+st.caption("① EA_ADD_CODE 뒤 3자리에서 0이 아닌 자리 숫자를 고정 → ② 요목표 참조 → ③ 알라딘 수집 → ④ 챗G 도출")
 
 isbn = st.text_input("ISBN-13 입력", placeholder="예: 9791193904565").strip()
 go = st.button("분류기호 추천")
@@ -491,7 +549,7 @@ if go:
         norm = normalize_isbn13(isbn)
         if not norm or len(norm) != 13:
             st.info("ISBN-13 형식으로 입력하는 것을 권장합니다.")
-        with st.spinner("EA 자리앵커 확인 → 알라딘 정보 수집 → 챗G 판단…"):
+        with st.spinner("EA 자리앵커 확인 → 요목표 로딩 → 알라딘 정보 수집 → 챗G 판단…"):
             result = get_kdc_from_isbn(isbn13=norm or isbn, ttbkey=ALADIN_TTBKEY, openai_key=OPENAI_API_KEY, model=MODEL)
 
         st.subheader("결과")
@@ -499,13 +557,13 @@ if go:
         anchors = result.get("anchors") or {}
         pattern = anchors.get("pattern", "x-x-x")
         if last3:
-            st.markdown(f"- **EA_ADD_CODE 뒤 3자리**: `{last3}` → **앵커 패턴**: `{pattern}`")
+            st.markdown(f"- **EA_ADD_CODE 뒤 3자리**: `{last3}` → **자리앵커 패턴**: `{pattern}`")
         else:
             st.markdown("- **EA_ADD_CODE**: 조회 실패(다음 단계로 진행)")
         code = result.get("code")
         if code:
             st.markdown(f"### ✅ 추천 KDC: **`{code}`**")
-            st.caption("※ 자리앵커(백/십/일의 자리) 제약을 우선 적용하여 LLM 결과를 보정했습니다.")
+            st.caption("※ 자리앵커(백/십/일의 자리) 제약과 요목표를 반영해 LLM 결과를 보정했습니다.")
         else:
             st.error("분류기호 추천에 실패했습니다. ISBN/키를 확인하거나, 다시 시도해 주세요.")
 
@@ -513,29 +571,44 @@ if go:
         st.markdown("---")
         st.markdown("#### 🔎 추천 근거 (순위·조합 + 세부 요소)")
         sig = result.get("signals") or {}
-        rule_hits = result.get("rule_hits") or {}
         ranking = result.get("ranking") or []
         llm_raw = result.get("llm_raw")
+        o_hits = result.get("outline_hits") or {}
+        matched = o_hits.get("matched") or {}
+        dominant = o_hits.get("dominant")
+
         st.markdown(f"- **EA 자리앵커**: 백={anchors.get('hundreds') or 'x'}, 십={anchors.get('tens') or 'x'}, 일={anchors.get('units') or 'x'} (패턴 `{pattern}`)")
         st.markdown(f"- **LLM 원출력**: `{llm_raw or '-'}` → 앵커 보정 → `{code or '-'}`")
         st.markdown(f"- **사용 메타데이터**: 제목='{sig.get('title','')}', 카테고리='{sig.get('category','')}', 저자='{sig.get('author','')}', 출판사='{sig.get('publisher','')}'")
-        if rule_hits:
-            st.markdown("- **규칙 적중**: " + ", ".join([f"{k}→{'+'.join(v)}" for k, v in rule_hits.items()]))
-        else:
-            st.markdown("- **규칙 적중**: 없음")
+
+        with st.expander("요목표 키워드 적중", expanded=bool(matched)):
+            if matched:
+                for d, words in matched.items():
+                    name = KDC_OUTLINE.get(d, {}).get("name", d)
+                    st.markdown(f"- **{d}00 {name}** ← 적중: {', '.join(words)}")
+                if dominant:
+                    st.markdown(f"→ **가장 많은 적중 류(우세): {dominant}00 {KDC_OUTLINE.get(dominant,{}).get('name','')}**")
+            else:
+                st.caption("적중 없음")
 
         if ranking:
             import pandas as _pd
             rows = []
             for i, c in enumerate(ranking, start=1):
-                code_i = c.get("code"); conf = c.get("confidence")
+                code_i = c.get("code") or ""
+                conf = c.get("confidence")
                 try: conf_pct = f"{float(conf)*100:.1f}%"
                 except Exception: conf_pct = ""
                 factors = c.get("factors", {}) if isinstance(c.get("factors"), dict) else {}
+                # 요목표 적합(백의 자리 비교)
+                outline_ok = ""
+                if code_i and len(code_i) >= 1 and code_i[0].isdigit():
+                    outline_ok = "Yes" if (dominant and code_i[0] == dominant) else ("-")
                 rows.append({
                     "순위": i,
                     "KDC 후보": code_i,
                     "신뢰도": conf_pct,
+                    "요목표 적합(백의 자리)": outline_ok,
                     "근거 키워드": ", ".join((c.get("evidence_terms") or [])[:8]),
                     "가중치(title/category/author/publisher/desc/toc)": ", ".join(
                         [f"{k}:{factors.get(k):.2f}" for k in ["title","category","author","publisher","desc","toc"]
