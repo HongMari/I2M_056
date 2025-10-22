@@ -1,11 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-KDC 분류기 (ISBN -> 알라딘 -> LLM 제로샷 + 얇은 규칙 하이브리드)
-- UI는 기존 Streamlit 구성 유지
-- 하단에 '분류 근거(Why)' 섹션 추가
-- 정확도/안정성 패치 포함:
-  top-K JSON, 깊이 스코어, 후보 재선택기, 상위류 재시도, critic pass, validator
+KDC 분류기 (Streamlit secrets 기반 보안 버전)
 """
+
 import os
 import re
 import json
@@ -13,17 +10,38 @@ import time
 import requests
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Tuple
-
 import streamlit as st
 
 # =========================
-# 환경설정
+# 환경설정 (Secrets Manager)
 # =========================
-ALADIN_KEY = os.getenv("ALADIN_TTB_KEY", "")
-OPENAI_KEY = os.getenv("OPENAI_API_KEY", "")
+# secrets.toml 파일 예시:
+# [api_keys]
+# aladin = "ttbdawn63091003001"
+# openai = "sk-xxxxx..."
+# openai_model = "gpt-4o-mini"
 
+try:
+    ALADIN_KEY = st.secrets["api_keys"]["aladin"]
+except Exception:
+    ALADIN_KEY = ""
+
+try:
+    OPENAI_KEY = st.secrets["api_keys"]["openai"]
+except Exception:
+    OPENAI_KEY = ""
+
+OPENAI_MODEL = st.secrets["api_keys"].get("openai_model", "gpt-4o-mini")
 OPENAI_CHAT_COMPLETIONS = "https://api.openai.com/v1/chat/completions"
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # 필요 시 변경
+
+with st.sidebar:
+    st.markdown("### 설정")
+    st.text(f"🔑 알라딘 키: {'OK' if ALADIN_KEY else '미설정'}")
+    st.text(f"🤖 OpenAI 키: {'OK' if OPENAI_KEY else '미설정'}")
+    model = st.text_input("OpenAI 모델", value=OPENAI_MODEL)
+    st.markdown("---")
+    st.caption("환경설정은 `.streamlit/secrets.toml` 에서 관리됩니다.")
+
 
 # =========================
 # 데이터 모델
@@ -597,3 +615,4 @@ if run_btn:
 
 else:
     st.info("ISBN-13을 입력한 후 ‘분류기호 추천’을 눌러주세요.")
+
