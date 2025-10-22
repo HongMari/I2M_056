@@ -49,17 +49,35 @@ NLK_API_KEY = (
 MODEL = DEFAULT_MODEL
 
 # ───────── 환경설정 디버그 ─────────
+def _mask(v: str, keep: int = 4) -> str:
+    if not v: return ""
+    v = str(v)
+    if len(v) <= keep: return "*" * len(v)
+    return "*" * (len(v) - keep) + v[-keep:]
+
 with st.expander("⚙️ 환경설정 디버그", expanded=True):
     st.write("📁 앱 폴더:", Path(__file__).resolve().parent.as_posix())
     try:
-        st.write("🔑 secrets 키 목록:", list(st.secrets.keys()))
-    except Exception:
-        st.write("secrets 접근 불가(로컬 실행 중)")
+        top_keys = list(st.secrets.keys())
+        st.write("🔑 secrets 최상위 키 목록:", top_keys)
 
+        # 섹션 내부도 함께 표시(마스킹)
+        api_keys = dict(st.secrets.get("api_keys", {}))
+        if api_keys:
+            st.write("🔎 [api_keys] 섹션 내용(마스킹):", {
+                k: _mask(api_keys.get(k, "")) for k in api_keys
+            })
+        else:
+            st.write("🔎 [api_keys] 섹션 없음 또는 비어있음")
+
+    except Exception:
+        st.write("secrets 접근 불가(로컬 실행 중일 수 있음)")
+
+    # 로드 여부 플래그
     st.write("✅ OPENAI 키 로드됨?:", bool(OPENAI_API_KEY))
     st.write("✅ ALADIN 키 로드됨?:", bool(ALADIN_TTBKEY))
-    st.write("✅ 국립중앙도서관(NLK) 키 로드됨?:", bool(NLK_API_KEY))  # [NEW]
-
+    st.write("✅ 국립중앙도서관(NLK) 키 로드됨?:", bool(NLK_API_KEY))
+    
 # ───────── 데이터 구조 ─────────
 @dataclass
 class BookInfo:
@@ -278,3 +296,4 @@ if go:
                     "category": info.category,
                     "description": info.description[:300]
                 })
+
