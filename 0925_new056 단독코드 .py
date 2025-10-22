@@ -14,36 +14,42 @@ from typing import Optional, List, Dict, Tuple
 import os
 import streamlit as st
 
-# =========================
-# 🔐 Secrets 로더 (섹션/루트/env 모두 탐색)
-# =========================
-def _get_secret(candidate_names):
-    """
-    Streamlit Cloud의 Secrets(섹션[api_keys]/루트)와
-    환경변수(대문자)까지 순차 탐색하여 값을 찾는다.
-    """
-    for name in candidate_names:
-        # [api_keys] 섹션
-        try:
-            val = st.secrets.get("api_keys", {}).get(name)
-            if val: return str(val)
-        except Exception:
-            pass
-        # 루트 레벨
-        try:
-            val = st.secrets.get(name)
-            if val: return str(val)
-        except Exception:
-            pass
-        # 환경변수 (대문자 키도 확인)
-        val = os.getenv(name.upper())
-        if val: return str(val)
+# === Secrets 로더: [api_keys] 섹션/루트/env 순서로 탐색 ===
+def _get_secret(*names):
+    # 1) [api_keys] 섹션
+    for n in names:
+        v = st.secrets.get("api_keys", {}).get(n)
+        if v: return str(v)
+    # 2) 루트 레벨
+    for n in names:
+        v = st.secrets.get(n)
+        if v: return str(v)
+    # 3) 환경변수(대문자)
+    for n in names:
+        v = os.getenv(n.upper())
+        if v: return str(v)
     return ""
 
-ALADIN_KEY   = _get_secret(["aladin", "aladin_ttb_key"])
-OPENAI_KEY   = _get_secret(["openai", "openai_api_key"])
-OPENAI_MODEL = _get_secret(["openai_model"]) or "gpt-4o-mini"
+# 👉 너의 TOML 구조에 정확히 맞춤 (aladin / openai / openai_model)
+ALADIN_KEY   = _get_secret("aladin", "aladin_ttb_key")
+OPENAI_KEY   = _get_secret("openai", "openai_api_key")
+OPENAI_MODEL = _get_secret("openai_model") or "gpt-4o-mini"
+
 OPENAI_CHAT_COMPLETIONS = "https://api.openai.com/v1/chat/completions"
+
+# (선택) 진단: 값 자체는 감추고 '키 이름'만 보여줌
+if "debug" not in st.session_state:
+    st.session_state["debug"] = {
+        "secrets_api_keys_keys": list(st.secrets.get("api_keys", {}).keys()) if "api_keys" in st.secrets else [],
+        "secrets_root_keys": [k for k in st.secrets.keys() if k != "api_keys"],
+        "env_present": {
+            "ALADIN": bool(os.getenv("ALADIN")),
+            "ALADIN_TTB_KEY": bool(os.getenv("ALADIN_TTB_KEY")),
+            "OPENAI": bool(os.getenv("OPENAI")),
+            "OPENAI_API_KEY": bool(os.getenv("OPENAI_API_KEY")),
+            "OPENAI_MODEL": bool(os.getenv("OPENAI_MODEL")),
+        },
+    }
 
 # --- 진단 로그(값은 노출하지 않고 '키 이름/유무'만 기록) -------------
 if "debug" not in st.session_state:
@@ -604,3 +610,4 @@ if run_btn:
 
 else:
     st.info("ISBN-13을 입력한 후 ‘분류기호 추천’을 눌러주세요.")
+
