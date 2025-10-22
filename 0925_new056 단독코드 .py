@@ -545,7 +545,7 @@ st.markdown("---")
 st.subheader("🔎 분류 근거(Why)")
 
 with st.expander("상세 근거 펼치기", expanded=False):
-    # ⬇️ 여기부터 탭 두 개로 분리 (요약 / 원본 JSON)
+    # 요약 / 원본 JSON 탭
     tab_summary, tab_json = st.tabs(["요약", "원본 JSON"])
 
     with tab_summary:
@@ -594,19 +594,6 @@ with st.expander("상세 근거 펼치기", expanded=False):
     with tab_json:
         st.json(evidence)
 
-    # (선택) 불확실 배지
-    try:
-        avg_conf = 0.0
-        cands = evidence.get("llm_candidates") or []
-        if cands:
-            avg_conf = sum(float(c.get("conf", 0.0)) for c in cands) / len(cands)
-        if avg_conf < 0.6:
-            st.info("⚠️ 신뢰도가 낮습니다. 검토가 필요할 수 있습니다.")
-    except Exception:
-        pass
-
-else:
-    st.info("ISBN-13을 입력한 후 ‘분류기호 추천’을 눌러주세요.")
 
 
 
