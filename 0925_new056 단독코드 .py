@@ -540,11 +540,15 @@ if run_btn:
     else:
         st.error("분류기호를 산출하지 못했습니다. 근거 섹션을 확인하세요.")
 
-    # --- 분류 근거 섹션 (하단 추가) ---
-    st.markdown("---")
-    st.subheader("🔎 분류 근거(Why)")
+# --- 분류 근거 섹션 (하단) ---
+st.markdown("---")
+st.subheader("🔎 분류 근거(Why)")
 
-    with st.expander("상세 근거 펼치기", expanded=False):
+with st.expander("상세 근거 펼치기", expanded=False):
+    # ⬇️ 여기부터 탭 두 개로 분리 (요약 / 원본 JSON)
+    tab_summary, tab_json = st.tabs(["요약", "원본 JSON"])
+
+    with tab_summary:
         col1, col2 = st.columns(2)
         with col1:
             st.markdown("**입력 요약**")
@@ -587,8 +591,8 @@ if run_btn:
             st.write(f"- Critic 검토: {'통과' if evidence['critic'].get('ok') else '재검토'}"
                      + (f" / 메모: {evidence['critic'].get('note')}" if evidence['critic'].get('note') else ""))
 
-        with st.expander("원본 Evidence JSON 보기 (전문)"):
-            st.json(evidence)
+    with tab_json:
+        st.json(evidence)
 
     # (선택) 불확실 배지
     try:
@@ -603,6 +607,7 @@ if run_btn:
 
 else:
     st.info("ISBN-13을 입력한 후 ‘분류기호 추천’을 눌러주세요.")
+
 
 
 
