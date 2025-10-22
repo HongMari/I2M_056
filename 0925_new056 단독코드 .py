@@ -430,44 +430,94 @@ if go:
         else:
             st.error("분류기호 추천에 실패했습니다. ISBN/키를 확인하거나, 다시 시도해 주세요.")
 
-        # ───────── 근거/순위·조합 + 세부 요소 ─────────
-        st.markdown("---")
-        st.markdown("#### 🔎 추천 근거 (순위·조합 + 세부 요소)")
-        sig = result.get("signals") or {}
-        rule_hits = result.get("rule_hits") or {}
-        ranking = result.get("ranking") or []
-        llm_raw = result.get("llm_raw")
+# ───────── 수정: 근거/순위 JSON 파싱 견고화 ─────────
+def ask_llm_for_kdc_ranking(book: BookInfo, api_key: str, model: str, anchor_clause: str) -> Optional[List[Dict[str, Any]]]:
+    if not api_key:
+        return None
 
-        with st.expander("근거 요약", expanded=True):
-            st.markdown(f"- **EA 자리앵커**: 백={anchors.get('hundreds') or 'x'}, 십={anchors.get('tens') or 'x'}, 일={anchors.get('units') or 'x'} (패턴 `{pattern}`)")
-            st.markdown(f"- **LLM 원출력**: `{llm_raw or '-'}' → 앵커 보정 → `{code or '-'}`")
-            st.markdown(f"- **사용 메타데이터**: 제목='{sig.get('title','')}', 카테고리='{sig.get('category','')}', 저자='{sig.get('author','')}', 출판사='{sig.get('publisher','')}'")
-            if rule_hits:
-                st.markdown("- **규칙 적중**: " + ", ".join([f"{k}→{'+'.join(v)}" for k,v in rule_hits.items()]))
-            else:
-                st.markdown("- **규칙 적중**: 없음")
+    # JSON만 출력하도록 강하게 제약 (코드펜스/마크다운/주석 금지, 트레일링 콤마 금지)
+    sys_prompt = (
+        "너는 한국 십진분류(KDC) 전문가다. 아래 도서 정보를 분석하여 상위 후보를 JSON으로만 반환하라. "
+        "반드시 RFC 8259에 맞는 유효한 JSON 하나만 출력하고, 마크다운/코드펜스/설명/주석은 절대 포함하지 마라. "
+        "스키마: {\"candidates\":[{\"code\":str,\"confidence\":float,"
+        "\"evidence_terms\":[str...],\"_view\":str,"
+        "\"factors\":{\"title\":float,\"category\":float,\"author\":float,"
+        "\"publisher\":float,\"desc\":float,\"toc\":float}}]} "
+        "confidence는 0~1. evidence_terms는 1~8개. "
+        "factors의 각 값은 0~1. "
+        + anchor_clause
+    )
 
-        if ranking:
-            import pandas as _pd
-            rows = []
-            for i, c in enumerate(ranking, start=1):
-                code_i = c.get("code"); conf = c.get("confidence")
-                try: conf_pct = f"{float(conf)*100:.1f}%" if conf is not None else ""
-                except Exception: conf_pct = ""
-                factors = c.get("factors", {}) if isinstance(c.get("factors"), dict) else {}
-                rows.append({
-                    "순위": i,
-                    "KDC 후보": code_i,
-                    "신뢰도": conf_pct,
-                    "근거 키워드": ", ".join((c.get("evidence_terms") or [])[:8]),
-                    "가중치(title/category/author/publisher/desc/toc)": ", ".join([f"{k}:{factors.get(k):.2f}" for k in ["title","category","author","publisher","desc","toc"] if isinstance(factors.get(k),(int,float))]) or "-",
-                    "참조 뷰": c.get("_view", "")
-                })
-            df = _pd.DataFrame(rows)
+    payload = {
+        "title": book.title, "author": book.author, "publisher": book.publisher,
+        "pub_date": book.pub_date, "isbn13": book.isbn13, "category": book.category,
+        "description": book.description[:1200], "toc": book.toc[:800]
+    }
+    user_prompt = (
+        "도서 정보(JSON):\n" + json.dumps(payload, ensure_ascii=False, indent=2) +
+        "\n\n상위 후보 3~5개를 confidence 내림차순으로, 스키마에 맞는 '유효한 JSON'만 출력."
+    )
+
+    def _extract_json_str(s: str) -> Optional[str]:
+        # 1) 코드펜스/마크다운 제거
+        s = re.sub(r"```(?:json)?\s*([\s\S]*?)```", r"\1", s, flags=re.IGNORECASE)
+        # 2) 앞뒤 공백/제어문자 제거
+        s = s.strip("\ufeff \t\r\n")
+        # 3) JSON 본문 범위 추정: 첫 '{' ~ 마지막 '}'
+        if "{" in s and "}" in s:
+            s = s[s.find("{"): s.rfind("}") + 1]
+        # 4) 흔한 오류 치유: 트레일링 콤마, 스마트쿼트, 주석 등
+        s = s.replace("“", "\"").replace("”", "\"").replace("’", "'").replace("‘", "'")
+        # 주석 제거 (// ... , /* ... */)
+        s = re.sub(r"//.*?$", "", s, flags=re.M)                       # 한 줄 주석
+        s = re.sub(r"/\*[\s\S]*?\*/", "", s)                            # 블록 주석
+        # 트레일링 콤마 제거
+        s = re.sub(r",\s*([}\]])", r"\1", s)
+        # 싱글쿼트를 더블쿼트로 (키/문자열) - JSON 유사 출력 방어
+        if '"' not in s and "'" in s:
+            s = re.sub(r"'", '"', s)
+        return s if s and s[0] == "{" and s[-1] == "}" else None
+
+    try:
+        resp = requests.post(
+            OPENAI_CHAT_COMPLETIONS,
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": 0.0,
+                "max_tokens": 512,
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        text = (data["choices"][0]["message"]["content"] or "").strip()
+
+        json_str = _extract_json_str(text)
+        if not json_str:
+            raise ValueError("유효한 JSON 블럭을 추출하지 못했습니다.")
+
+        parsed = json.loads(json_str)
+        cands = parsed.get("candidates") if isinstance(parsed, dict) else None
+        if isinstance(cands, list) and cands:
             try:
-                from caas_jupyter_tools import display_dataframe_to_user as _disp
-                _disp("추천 근거(순위표)", df)
+                cands = sorted(cands, key=lambda x: float(x.get("confidence", 0)), reverse=True)
             except Exception:
-                st.dataframe(df, use_container_width=True)
-        else:
-            st.info("근거 표시는 생성되지 않았습니다. (LLM JSON 실패 또는 신호 부족)")
+                pass
+            return cands
+
+        return None
+
+    except Exception as e:
+        st.info(f"근거/순위 JSON 생성 실패: {e}")
+        # 디버그용 원문 노출
+        with st.expander("LLM 근거 원문(디버그)"):
+            try:
+                st.code(text, language="json")
+            except Exception:
+                st.write(text)
+        return None
