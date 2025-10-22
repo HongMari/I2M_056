@@ -37,20 +37,6 @@ OPENAI_MODEL = _get_secret("openai_model") or "gpt-4o-mini"
 
 OPENAI_CHAT_COMPLETIONS = "https://api.openai.com/v1/chat/completions"
 
-# (선택) 진단: 값 자체는 감추고 '키 이름'만 보여줌
-if "debug" not in st.session_state:
-    st.session_state["debug"] = {
-        "secrets_api_keys_keys": list(st.secrets.get("api_keys", {}).keys()) if "api_keys" in st.secrets else [],
-        "secrets_root_keys": [k for k in st.secrets.keys() if k != "api_keys"],
-        "env_present": {
-            "ALADIN": bool(os.getenv("ALADIN")),
-            "ALADIN_TTB_KEY": bool(os.getenv("ALADIN_TTB_KEY")),
-            "OPENAI": bool(os.getenv("OPENAI")),
-            "OPENAI_API_KEY": bool(os.getenv("OPENAI_API_KEY")),
-            "OPENAI_MODEL": bool(os.getenv("OPENAI_MODEL")),
-        },
-    }
-
 # --- 진단 로그(값은 노출하지 않고 '키 이름/유무'만 기록) -------------
 if "debug" not in st.session_state:
     st.session_state["debug"] = {
@@ -610,4 +596,5 @@ if run_btn:
 
 else:
     st.info("ISBN-13을 입력한 후 ‘분류기호 추천’을 눌러주세요.")
+
 
