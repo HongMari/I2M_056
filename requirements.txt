@@ -1,0 +1,20 @@
+# 기본 Streamlit 앱 실행
+streamlit==1.39.0
+
+# 웹 요청 및 파싱
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+html5lib>=1.1
+lxml>=4.9.3
+
+# 데이터 구조 및 처리
+dataclasses-json>=0.6.3
+
+# 환경변수 로드 (선택)
+python-dotenv>=1.0.1
+
+# 텍스트 정규화 및 HTML 처리
+urllib3>=2.0.7
+
+# OpenAI API 호출
+openai>=1.50.2
