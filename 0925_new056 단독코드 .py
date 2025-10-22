@@ -30,6 +30,8 @@ ALADIN_LOOKUP_URL = "https://www.aladin.co.kr/ttb/api/ItemLookUp.aspx"
 ALADIN_SEARCH_URL = "https://www.aladin.co.kr/search/wsearchresult.aspx"
 OPENAI_CHAT_COMPLETIONS = "https://api.openai.com/v1/chat/completions"
 NLK_SEARCH_API = "https://www.nl.go.kr/NL/search/openApi/search.do"
+NLK_SEOJI_API  = "https://www.nl.go.kr/seoji/SearchApi.do"  # ISBN 서지 API (docs[].EA_ADD_CODE)
+
 
 with st.expander("환경설정 디버그", expanded=True):
     st.write("📁 앱 폴더:", Path(__file__).resolve().parent.as_posix())
@@ -118,36 +120,80 @@ def normalize_isbn13(isbn: str) -> str:
 # ───────── 0) NLK EA_ADD_CODE 조회 (류 앵커 고정) ─────────
 
 def get_ea_add_code_last3(isbn13: str, key: str) -> Optional[str]:
+    """
+    EA_ADD_CODE의 뒤 3자리 반환.
+    1차: 서지(ISBN) API /seoji/SearchApi.do → docs[0].EA_ADD_CODE
+    2차: 일반검색 /NL/search/openApi/search.do → result.recordList[0].EA_ADD_CODE
+    """
     if not key:
         st.info("NLK_API_KEY가 없어 EA_ADD_CODE 조회를 건너뜁니다.")
         return None
+
+    # ---------- 1) 서지(ISBN) API ---------- #
     try:
-        params = {
-            "key": key,
+        p1 = {
+            "cert_key": key,         # 서지 API는 cert_key 사용
+            "result_style": "json",
+            "page_no": 1,
+            "page_size": 5,
+            "isbn": isbn13,
+        }
+        r1 = requests.get(NLK_SEOJI_API, params=p1, headers=HEADERS, timeout=10)
+        r1.raise_for_status()
+        d1 = r1.json() if r1.headers.get("Content-Type","").lower().startswith("application/json") else json.loads(r1.text)
+
+        docs = d1.get("docs")
+        if isinstance(docs, list) and docs:
+            d0 = docs[0] if isinstance(docs[0], dict) else {}
+            ea = d0.get("EA_ADD_CODE") or d0.get("ea_add_code")
+            if ea:
+                m = re.search(r"(\d{3})$", str(ea))
+                if m:
+                    last3 = m.group(1)
+                    st.success(f"(서지API) EA_ADD_CODE: {ea} → 뒤 3자리={last3}")
+                    return last3
+        else:
+            st.info("서지API 응답에 docs가 없거나 비어 있음 → 일반검색 백업")
+    except Exception as e:
+        st.info(f"서지API 실패 → 일반검색 백업: {e}")
+
+    # ---------- 2) 일반검색 API(백업) ---------- #
+    try:
+        p2 = {
+            "key": key,              # 일반검색은 key 사용
             "srchTarget": "total",
             "kwd": isbn13,
             "pageNum": 1,
             "pageSize": 1,
             "apiType": "json",
         }
-        r = requests.get(NLK_SEARCH_API, params=params, headers=HEADERS, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        recs = (data or {}).get("result", {}).get("recordList", [])
-        if not recs:
-            st.warning(f"NLK SearchApi EA_ADD_CODE 조회 실패: 결과 없음 ({isbn13})")
-            return None
-        ea_code = recs[0].get("ea_add_code") or recs[0].get("EA_ADD_CODE")
-        if not ea_code:
-            st.warning("EA_ADD_CODE 미존재")
-            return None
-        m = re.search(r"(\d{3})$", str(ea_code))
-        if not m:
-            st.warning(f"EA_ADD_CODE 형식 인식 실패: {ea_code}")
-            return None
-        last3 = m.group(1)
-        st.success(f"EA_ADD_CODE 감지: {ea_code} → 뒤 3자리={last3}")
-        return last3
+        r2 = requests.get(NLK_SEARCH_API, params=p2, headers=HEADERS, timeout=10)
+        r2.raise_for_status()
+        d2 = r2.json() if r2.headers.get("Content-Type","").lower().startswith("application/json") else json.loads(r2.text)
+
+        result = d2.get("result")
+        if isinstance(result, list):
+            result = result[0] if result else {}
+        recs = None
+        if isinstance(result, dict):
+            recs = result.get("recordList") or result.get("recordlist") or result.get("records") or result.get("record")
+        if isinstance(recs, dict):
+            recs = [recs]
+        if isinstance(recs, list) and recs:
+            rec0 = recs[0]
+            if isinstance(rec0, list) and rec0:
+                rec0 = rec0[0]
+            if isinstance(rec0, dict):
+                ea = rec0.get("EA_ADD_CODE") or rec0.get("ea_add_code")
+                if ea:
+                    m = re.search(r"(\d{3})$", str(ea))
+                    if m:
+                        last3 = m.group(1)
+                        st.success(f"(일반검색) EA_ADD_CODE: {ea} → 뒤 3자리={last3}")
+                        return last3
+
+        st.warning("NLK SearchApi EA_ADD_CODE 조회 실패: 응답 구조 미일치")
+        return None
     except Exception as e:
         st.warning(f"NLK SearchApi EA_ADD_CODE 조회 실패: {e}")
         return None
@@ -402,3 +448,4 @@ if go:
             st.caption("※ LLM 출력은 '숫자만'으로 제한되며, 류(백의 자리)는 EA 앵커에 맞춰 고정됩니다.")
         else:
             st.error("분류기호 추천에 실패했습니다. ISBN/키를 확인하거나, 다시 시도해 주세요.")
+
