@@ -449,3 +449,48 @@ if go:
         else:
             st.error("분류기호 추천에 실패했습니다. ISBN/키를 확인하거나, 다시 시도해 주세요.")
 
+# ───────── 근거/순위·조합 표시 ─────────
+st.markdown("---")
+st.markdown("#### 🔎 추천 근거 (순위·조합)")
+ryu = result.get("ryu")
+ranking = result.get("ranking") or []
+sig = result.get("signals") or {}
+
+
+with st.expander("근거 요약", expanded=True):
+st.markdown(
+f"- **EA 앵커(류)**: `{ryu or '-'}'`")
+st.markdown(
+f"- **신호 조합**: 제목/카테고리/저자/출판사에서 핵심 키워드를 추출해 LLM이 산출한 후보의 confidence를 계산")
+st.markdown(
+f"- **사용된 메타데이터**: 제목='{sig.get('title','')}', 카테고리='{sig.get('category','')}', 저자='{sig.get('author','')}', 출판사='{sig.get('publisher','')}'")
+
+
+# 후보 테이블
+if ranking:
+import pandas as _pd
+rows = []
+for i, c in enumerate(ranking, start=1):
+code_i = c.get("code")
+conf = c.get("confidence")
+try:
+conf_pct = f"{float(conf)*100:.1f}%" if conf is not None else ""
+except Exception:
+conf_pct = ""
+rows.append({
+"순위": i,
+"KDC 후보": code_i,
+"신뢰도": conf_pct,
+"근거 키워드": ", ".join(c.get("evidence_terms", [])[:6]),
+"참조 뷰": c.get("_view", "")
+})
+df = _pd.DataFrame(rows)
+try:
+from caas_jupyter_tools import display_dataframe_to_user as _disp
+_disp("추천 근거(순위표)", df)
+except Exception:
+st.dataframe(df, use_container_width=True)
+else:
+st.info("근거 표시는 생성되지 않았습니다. (LLM JSON 실패 또는 신호 부족)")
+
+
