@@ -457,7 +457,7 @@ if go:
         signals = (result.get("signals") if isinstance(result, dict) else None) or {}
         ryu = (result.get("ryu") if isinstance(result, dict) else None)
 
-        with st.expander("근거 요약", expanded=True):
+    with st.expander("근거 요약", expanded=True):
         st.markdown(f"- **EA 앵커(류)**: `{ryu or '-'}`")
         st.markdown("- **신호 조합**: 제목/카테고리/저자/출판사 키워드를 종합하여 후보별 confidence 산정")
         st.markdown(
@@ -488,3 +488,4 @@ if go:
         st.dataframe(pd.DataFrame(rows), use_container_width=True)
     else:
         st.info("근거 표시는 생성되지 않았습니다. (후보 없음 또는 LLM JSON 실패)")
+
