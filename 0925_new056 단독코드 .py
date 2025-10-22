@@ -472,7 +472,7 @@ if go:
         import pandas as pd
         rows = []
         for i, c in enumerate(ranking, start=1):
-              code_i = c.get("code", "")
+            code_i = c.get("code", "")
             conf = c.get("confidence")
             try:
                 conf_pct = f"{float(conf)*100:.1f}%"
@@ -484,8 +484,9 @@ if go:
                 "신뢰도": conf_pct,
                 "근거 키워드": ", ".join((c.get("evidence_terms") or [])[:6]),
                 "참조 뷰": c.get("_view", ""),
-        })
+            })
         st.dataframe(pd.DataFrame(rows), use_container_width=True)
     else:
         st.info("근거 표시는 생성되지 않았습니다. (후보 없음 또는 LLM JSON 실패)")
+
 
