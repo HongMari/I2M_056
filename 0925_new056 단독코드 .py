@@ -14,39 +14,46 @@ from typing import Optional, List, Dict, Tuple
 import os
 import streamlit as st
 
-# === Secrets 로더: [api_keys] 섹션/루트/env 순서로 탐색 ===
-def _get_secret(*names):
-    # 1) [api_keys] 섹션
-    for n in names:
-        v = st.secrets.get("api_keys", {}).get(n)
-        if v: return str(v)
-    # 2) 루트 레벨
-    for n in names:
-        v = st.secrets.get(n)
-        if v: return str(v)
-    # 3) 환경변수(대문자)
-    for n in names:
-        v = os.getenv(n.upper())
-        if v: return str(v)
+# --- Secrets 로더: [api_keys]/루트/env 모두 탐색 + *_key 이름도 허용 ---
+def _get_secret(candidate_names):
+    for name in candidate_names:
+        # 1) [api_keys] 섹션
+        try:
+            val = st.secrets.get("api_keys", {}).get(name)
+            if val: return str(val)
+        except Exception:
+            pass
+        # 2) 루트 레벨
+        try:
+            val = st.secrets.get(name)
+            if val: return str(val)
+        except Exception:
+            pass
+        # 3) 환경변수(대문자)
+        val = os.getenv(name.upper())
+        if val: return str(val)
     return ""
 
-# 👉 너의 TOML 구조에 정확히 맞춤 (aladin / openai / openai_model)
-ALADIN_KEY   = _get_secret("aladin", "aladin_ttb_key")
-OPENAI_KEY   = _get_secret("openai", "openai_api_key")
-OPENAI_MODEL = _get_secret("openai_model") or "gpt-4o-mini"
+# ⚠️ 당신의 현재 Secrets에 맞춰 후보 이름을 넉넉히 넣었습니다.
+#    (openai/openai_key, aladin/aladin_key 모두 수용)
+ALADIN_KEY   = _get_secret(["aladin", "aladin_key", "aladin_ttb_key"])
+OPENAI_KEY   = _get_secret(["openai", "openai_key", "openai_api_key"])
+OPENAI_MODEL = _get_secret(["openai_model", "openai_model_key"]) or "gpt-4o-mini"
 
 OPENAI_CHAT_COMPLETIONS = "https://api.openai.com/v1/chat/completions"
 
-# --- 진단 로그(값은 노출하지 않고 '키 이름/유무'만 기록) -------------
+# 진단(값은 숨기고 키 이름/존재만)
 if "debug" not in st.session_state:
     st.session_state["debug"] = {
         "secrets_api_keys_keys": list(st.secrets.get("api_keys", {}).keys()) if "api_keys" in st.secrets else [],
         "secrets_root_keys": [k for k in st.secrets.keys() if k != "api_keys"],
-        "env_present": { "ALADIN": bool(os.getenv("ALADIN")),
-                         "ALADIN_TTB_KEY": bool(os.getenv("ALADIN_TTB_KEY")),
-                         "OPENAI": bool(os.getenv("OPENAI")),
-                         "OPENAI_API_KEY": bool(os.getenv("OPENAI_API_KEY")),
-                         "OPENAI_MODEL": bool(os.getenv("OPENAI_MODEL")) }
+        "env_present": {
+            "ALADIN": bool(os.getenv("ALADIN")),
+            "ALADIN_TTB_KEY": bool(os.getenv("ALADIN_TTB_KEY")),
+            "OPENAI": bool(os.getenv("OPENAI")),
+            "OPENAI_API_KEY": bool(os.getenv("OPENAI_API_KEY")),
+            "OPENAI_MODEL": bool(os.getenv("OPENAI_MODEL")),
+        },
     }
 
 # =========================
@@ -596,5 +603,6 @@ if run_btn:
 
 else:
     st.info("ISBN-13을 입력한 후 ‘분류기호 추천’을 눌러주세요.")
+
 
 
